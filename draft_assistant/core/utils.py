@@ -1,10 +1,16 @@
 from __future__ import annotations
+import io
 import re
-from typing import Dict, List
+from typing import Dict, List, Iterable, Union
 import numpy as np
 import pandas as pd
 
-POSS = ["QB", "RB", "WR", "TE", "K", "DEF"]
+# Canonical positions
+POSS = ["QB", "RB", "WR", "TE", "K", "DEF", "DST"]
+
+# -----------------------------
+# Names & normalization
+# -----------------------------
 
 def norm_name(s: str) -> str:
     if not isinstance(s, str):
@@ -13,94 +19,149 @@ def norm_name(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _upper_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip().upper() for c in df.columns]
     return df
 
 def _apply_aliases(df: pd.DataFrame) -> pd.DataFrame:
-    """Map common CSV header synonyms to our canonical names."""
+    """Map common CSV/Excel header synonyms to canonical names expected downstream."""
     aliases = {
-        "PLAYER": ["NAME", "PLAYER_NAME", "FULL_NAME"],
-        "POS": ["POSITION", "POS."],
-        "PROJ_PTS": ["PROJ", "PROJECTION", "PROJECTIONS", "PPR", "PPR_PTS", "FPTS", "FANTASY_POINTS"],
+        "PLAYER": ["NAME","PLAYER_NAME","FULL_NAME","PLAYERID","PLAYER ID"],
+        "POS": ["POSITION","POS."],
+        "TEAM": ["NFL","TM","TMR","CLUB"],
+        "PROJ_PTS": ["PROJ","PROJECTION","PROJECTIONS","PPR","PPR_PTS","FPTS","FANTASY_POINTS"],
+        "ADP": ["AVG_DRAFT_POS","AVG PICK","AVG_PICK","ADP_PPR"],
+        "ECR": ["RANK_ECR","CONS_RANK","EXPERT_RANK"],
+        "TIER": ["TIERS","TIERING"],
+        "BYE": ["BYE_WEEK","BYE WK","BYEWK"],
+        "INJURY_RISK": ["INJ","INJURY","RISK"],
     }
-    colset = set(df.columns)
+    present = set(df.columns)
     for canon, alts in aliases.items():
-        if canon in colset:
+        if canon in present:
             continue
         for a in alts:
-            if a in colset:
+            if a in present:
                 df[canon] = df[a]
                 break
     return df
 
 def ensure_player_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure required/optional columns exist and are typed correctly.
-    Required: PLAYER, POS, PROJ_PTS (or component stats so PROJ_PTS can be recomputed later)
-    Optional: TEAM, ADP, ECR, TIER, BYE, INJURY_RISK, SOS_SEASON, TGT_SHARE, RUSH_SHARE,
-              GOAL_LINE_SHARE, AIR_YARDS, ROUTE_PCT, REDZONE_TGT
-    Adds: PLAYER_KEY, INJURY_VAL
-    """
-    df = normalize_columns(df)
+    df = _upper_cols(df)
     df = _apply_aliases(df)
 
-    # If POS contains DST, map to DEF
-    if "POS" in df.columns:
-        df["POS"] = df["POS"].astype(str).str.upper().str.replace("DST", "DEF", regex=False)
-
-    required = ["PLAYER", "POS"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}. Need at least {required} + projections.")
-
-    # If PROJ_PTS missing, allow component-based recompute later, otherwise raise
+    # Required minima
+    if "PLAYER" not in df.columns or "POS" not in df.columns:
+        raise ValueError("Players table needs at least PLAYER and POS columns.")
+    # Accept either PROJ_PTS or components; if neither, error
     has_components = any(c in df.columns for c in [
         "PASS_YDS","PASS_TD","PASS_INT","RUSH_YDS","RUSH_TD","REC","REC_YDS","REC_TD","TWO_PT"
     ])
     if "PROJ_PTS" not in df.columns and not has_components:
-        raise ValueError(
-            "Missing PROJ_PTS and no component stat columns found. "
-            "Provide PROJ_PTS or any of PASS_YDS, PASS_TD, PASS_INT, RUSH_YDS, RUSH_TD, REC, REC_YDS, REC_TD."
-        )
-    if "PROJ_PTS" not in df.columns:
-        df["PROJ_PTS"] = np.nan  # will be recomputed by evaluation layer if components exist
+        raise ValueError("Provide PROJ_PTS or component stats (PASS_YDS/PASS_TD/PASS_INT/RUSH_YDS/RUSH_TD/REC/REC_YDS/REC_TD).")
 
-    # Ensure optional columns exist
-    for c in [
-        "TEAM","ADP","ECR","TIER","BYE","INJURY_RISK","SOS_SEASON","TGT_SHARE","RUSH_SHARE",
-        "GOAL_LINE_SHARE","AIR_YARDS","ROUTE_PCT","REDZONE_TGT"
-    ]:
+    # Optional columns
+    for c in ["TEAM","ADP","ECR","TIER","BYE","INJURY_RISK","SOS_SEASON","TGT_SHARE","RUSH_SHARE",
+              "GOAL_LINE_SHARE","AIR_YARDS","ROUTE_PCT","REDZONE_TGT"]:
         if c not in df.columns:
             df[c] = np.nan
 
-    # Types
+    # Normalize values
     df["PLAYER_KEY"] = df["PLAYER"].map(norm_name)
-    for c in [
-        "PROJ_PTS","ADP","ECR","TIER","BYE","SOS_SEASON","TGT_SHARE","RUSH_SHARE",
-        "GOAL_LINE_SHARE","AIR_YARDS","ROUTE_PCT","REDZONE_TGT"
-    ]:
+    df["POS"] = df["POS"].astype(str).str.upper().str.replace("DST","DEF", regex=False)
+
+    # Numeric coercions
+    for c in ["PROJ_PTS","ADP","ECR","TIER","BYE","SOS_SEASON","TGT_SHARE","RUSH_SHARE",
+              "GOAL_LINE_SHARE","AIR_YARDS","ROUTE_PCT","REDZONE_TGT"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # Injury mapping to numeric penalty 0..~0.2
     def _injury_val(x):
-        if isinstance(x, (int, float)) and not pd.isna(x):
-            return float(x)
-        if not isinstance(x, str):
-            return np.nan
+        if isinstance(x,(int,float)) and not pd.isna(x): return float(x)
+        if not isinstance(x,str): return np.nan
         s = x.strip().lower()
         if s in ("low","l"): return 0.05
         if s in ("med","moderate","m"): return 0.12
         if s in ("high","h"): return 0.20
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
+        try: return float(s)
+        except Exception: return np.nan
 
     df["INJURY_VAL"] = df["INJURY_RISK"].map(_injury_val)
     return df
 
-def starters_from_roster_positions(roster_positions: List[str]) -> Dict[str,int]:
+# -----------------------------
+# File I/O — CSV & Excel
+# -----------------------------
+
+def read_player_table(path_or_buffer: Union[str, io.BytesIO, io.BufferedReader]) -> pd.DataFrame:
+    """
+    Read CSV or Excel and normalize headers/columns. Works with file-like objects.
+    """
+    if isinstance(path_or_buffer, (io.BytesIO, io.BufferedReader)):
+        head = path_or_buffer.read(16)
+        # reset cursor
+        path_or_buffer.seek(0)
+        is_excel = head[:2] == b"PK"  # xlsx zip header heuristic
+        df = pd.read_excel(path_or_buffer) if is_excel else pd.read_csv(path_or_buffer)
+    else:
+        if str(path_or_buffer).lower().endswith((".xlsx",".xls")):
+            df = pd.read_excel(path_or_buffer)
+        else:
+            df = pd.read_csv(path_or_buffer)
+
+    return ensure_player_cols(df)
+
+# -----------------------------
+# Draft math & roster helpers
+# -----------------------------
+
+def snake_position(overall_pick: int, teams: int) -> tuple[int,int,int]:
+    """Return (round, pick_in_round, slot_on_clock) for serpentine draft."""
+    rnd = (overall_pick - 1) // teams + 1
+    pick_in_round = (overall_pick - 1) % teams + 1
+    if rnd % 2 == 1:
+        slot = pick_in_round
+    else:
+        slot = teams - pick_in_round + 1
+    return rnd, pick_in_round, slot
+
+def slot_for_round_pick(round_num: int, pick_in_round: int, teams: int) -> int:
+    """Compute slot for a (round, pick) in a snake draft."""
+    if round_num % 2 == 1:
+        return pick_in_round
+    return teams - pick_in_round + 1
+
+def user_roster_id(users: List[dict], username: str) -> int | None:
+    """Find the user's roster_id by matching display_name case-insensitively."""
+    if not users or not username:
+        return None
+    u = str(username).strip().lower()
+    for item in users:
+        if str(item.get("display_name","")).strip().lower() == u:
+            # Sleeper user object also includes 'user_id'; roster_id is per league
+            return item.get("roster_id")
+    return None
+
+def slot_to_display_name(slot: int, users: List[dict]) -> str:
+    """Map slot/roster_id to a display name, else 'Slot N'."""
+    for item in users or []:
+        if str(item.get("roster_id")) == str(slot):
+            return item.get("display_name") or f"Slot {slot}"
+    return f"Slot {slot}"
+
+def remove_players_by_name(df: pd.DataFrame, names: Iterable[str]) -> pd.DataFrame:
+    """Filter out players whose normalized names are in 'names'."""
+    keys = set(norm_name(n) for n in names if isinstance(n, str))
+    if "PLAYER_KEY" not in df.columns:
+        df = ensure_player_cols(df)
+    return df[~df["PLAYER_KEY"].isin(keys)].copy()
+
+# -----------------------------
+# Roster/FLEX baseline helpers (used by evaluation.py)
+# -----------------------------
+
+def starters_from_roster_positions(roster_positions: List[str]) -> Dict[str, int]:
     counts = {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0,"FLEX":0}
     for pos in roster_positions or []:
         p = str(pos).upper()
@@ -110,19 +171,21 @@ def starters_from_roster_positions(roster_positions: List[str]) -> Dict[str,int]
             counts["FLEX"] += 1
     return counts
 
-def apply_flex_adjustment(df: pd.DataFrame, teams: int, starters: Dict[str,int], repl_pts: Dict[str,float]) -> Dict[str,float]:
+def apply_flex_adjustment(
+    df: pd.DataFrame, teams: int, starters: Dict[str,int], repl_pts: Dict[str,float]
+) -> Dict[str,float]:
     flex = int(starters.get("FLEX", 0) or 0)
     if flex <= 0:
         return repl_pts
-    skill_mask = df["POS"].isin(["RB","WR","TE"])
-    combo = df[skill_mask].sort_values("EVAL_PTS", ascending=False)
+    mask = df["POS"].isin(["RB","WR","TE"])
+    combo = df[mask].sort_values("EVAL_PTS", ascending=False)
     if combo.empty:
         return repl_pts
     total_core = teams * (starters.get("RB",0)+starters.get("WR",0)+starters.get("TE",0))
-    flex_index = min(len(combo)-1, total_core + teams*flex - 1)
-    if flex_index < 0:
+    index = min(len(combo)-1, total_core + teams*flex - 1)
+    if index < 0:
         return repl_pts
-    flex_baseline = float(combo.iloc[flex_index]["EVAL_PTS"])
+    flex_baseline = float(combo.iloc[index]["EVAL_PTS"])
     for p in ["RB","WR","TE"]:
         repl_pts[p] = min(repl_pts.get(p, flex_baseline), flex_baseline)
     return repl_pts
