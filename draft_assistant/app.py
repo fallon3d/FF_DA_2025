@@ -60,13 +60,16 @@ def sidebar_controls():
 
     st.sidebar.header("League")
     league_id = st.sidebar.text_input("Sleeper League ID", value="")
+    username = st.sidebar.text_input("Your Sleeper username (optional)", value="Fallon3D")
+    seat = st.sidebar.number_input("Your draft slot (1–12, optional)", 1, 12, 1)
+
     poll_secs = st.sidebar.slider("Auto-refresh seconds", 2, 30, 5, 1)
     auto = st.sidebar.toggle("Auto-refresh", value=False)
 
-    return csv_df, weights, league_id, poll_secs, auto
+    return csv_df, weights, league_id, poll_secs, auto, username, int(seat)
 
 # =========================
-# Helpers: picks parsing
+# Helpers: picks parsing & snake window
 # =========================
 
 def normalize_picks(picks):
@@ -83,7 +86,6 @@ def normalize_picks(picks):
                 return val
         return []
     return picks if isinstance(picks, list) else []
-
 
 def map_taken_from_picks(picks, players_index):
     """
@@ -130,7 +132,6 @@ def map_taken_from_picks(picks, players_index):
 
     return taken_keys, pos_history
 
-
 def roster_need_state(my_roster_counts, starters_counts):
     """
     Soft roster guardrails: aim for starters + 1 depth by mid draft.
@@ -142,7 +143,6 @@ def roster_need_state(my_roster_counts, starters_counts):
         target = max(want, 1) + 1
         need[pos] = max(0, target - have)
     return need
-
 
 def fetch_live_state(league_id):
     """
@@ -168,11 +168,35 @@ def fetch_live_state(league_id):
     picks = normalize_picks(picks)
     return league, teams, roster_positions, user_map, draft_id, picks
 
+def compute_next_pick_window(teams: int, seat: int, current_overall_pick: int) -> int:
+    """
+    Distance (in selections) from the current overall pick to your next pick
+    in a standard snake draft. seat is 1..teams.
+    """
+    if not (1 <= seat <= teams):
+        return teams  # safe default
+
+    # Round and position within the round (1-based)
+    rnd = (current_overall_pick - 1) // teams + 1
+    pos = (current_overall_pick - 1) % teams + 1
+
+    # Your position within the current round (snake reverses every round)
+    my_pos_this = seat if rnd % 2 == 1 else (teams - seat + 1)
+
+    if my_pos_this >= pos:
+        # You still pick later this round
+        return my_pos_this - pos
+
+    # Otherwise, you'll pick next round at the opposite side
+    my_pos_next = (teams - seat + 1) if rnd % 2 == 1 else seat
+    # Remaining picks in this round + picks before your next-round slot
+    return (teams - pos) + my_pos_next
+
 # =========================
 # Tabs
 # =========================
 
-def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
+def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh, username, seat):
     st.subheader("Live Draft (Sleeper)")
     if not league_id:
         st.info("Enter your Sleeper League ID in the sidebar to begin.")
@@ -191,11 +215,22 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
         return
     st.write(f"Draft ID: `{draft_id}`")
 
-    # Select your team for roster need tracking
+    # Select your team for roster need tracking (try username first)
     my_user_id = None
-    if user_map:
-        my_display = st.selectbox("Select your user/team (for roster tracking)", list(user_map.keys()))
-        my_user_id = user_map.get(my_display)
+    matched_key = None
+    if user_map and username:
+        for disp, uid in user_map.items():
+            if str(disp).strip().lower() == str(username).strip().lower():
+                my_user_id = uid
+                matched_key = disp
+                break
+
+    if my_user_id:
+        st.success(f"Matched Sleeper user: **{matched_key}**")
+    else:
+        if user_map:
+            my_display = st.selectbox("Select your user/team (for roster tracking)", list(user_map.keys()))
+            my_user_id = user_map.get(my_display)
 
     players_index = sleeper_players_cache()
     taken_keys, pos_history = map_taken_from_picks(picks, players_index)
@@ -206,8 +241,8 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
         mine = [p for p in picks if isinstance(p, dict) and str(p.get("picked_by")) == str(my_user_id)]
         my_pos = []
         for p in mine:
-            pos = ""
             pid = str(p.get("player_id") or (p.get("metadata") or {}).get("player_id") or "")
+            pos = ""
             if pid and pid in players_index:
                 pos = players_index[pid].get("position", "")
             if pos:
@@ -218,8 +253,19 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
         st.warning("Upload or load your player CSV in the sidebar.")
         return
 
-    # Evaluate and suggest
-    avail_df, starters = evaluate_players(csv_df, SCORING_DEFAULT, teams, roster_positions, weights, taken_keys)
+    # Evaluate and suggest (snake-aware VONA window)
+    current_overall_pick = len(picks) + 1
+    next_window = compute_next_pick_window(teams, seat, current_overall_pick)
+
+    avail_df, starters = evaluate_players(
+        csv_df,
+        SCORING_DEFAULT,
+        teams,
+        roster_positions,
+        weights,
+        taken_keys,
+        next_pick_window=next_window,
+    )
     needs = roster_need_state(my_roster_counts, starters)
     sugg = suggest(avail_df, needs, weights, topk=8)
 
@@ -244,15 +290,14 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
     # Manual/auto refresh
     colr1, colr2 = st.columns([1, 1])
     with colr1:
-        if st.button("Refresh now"):
+        if st.button("🔄 Pull latest from Sleeper"):
             st.experimental_rerun()
     with colr2:
         if auto_refresh:
             time.sleep(poll_secs)
             st.experimental_rerun()
 
-
-def mock_tab(csv_df, weights):
+def mock_tab(csv_df, weights, seat):
     st.subheader("Mock Draft (Sleeper URL)")
     url = st.text_input("Paste Sleeper mock draft URL")
     if not url:
@@ -280,7 +325,18 @@ def mock_tab(csv_df, weights):
         st.warning("Upload or load your player CSV in the sidebar.")
         return
 
-    avail_df, starters = evaluate_players(csv_df, SCORING_DEFAULT, teams, roster_positions, weights, taken_keys)
+    current_overall_pick = len(normalize_picks(picks)) + 1
+    next_window = compute_next_pick_window(teams, seat, current_overall_pick)
+
+    avail_df, starters = evaluate_players(
+        csv_df,
+        SCORING_DEFAULT,
+        teams,
+        roster_positions,
+        weights,
+        taken_keys,
+        next_pick_window=next_window,
+    )
     needs = {"QB": 1, "RB": 2, "WR": 2, "TE": 1}
     sugg = suggest(avail_df, needs, weights, topk=8)
 
@@ -290,7 +346,6 @@ def mock_tab(csv_df, weights):
     st.markdown("### Player Board (Available)")
     show_cols = ["PLAYER", "TEAM", "POS", "TIER", "ADP", "EVAL_PTS", "VBD", "VONA", "INJURY_RISK", "SOS_SEASON"]
     st.dataframe(avail_df[show_cols].sort_values(["VBD", "EVAL_PTS"], ascending=False), use_container_width=True)
-
 
 def board_tab(csv_df, weights):
     st.subheader("Player Board & Filters")
@@ -327,13 +382,13 @@ def board_tab(csv_df, weights):
 
 def main():
     st.title("Fantasy Football Draft Assistant — VBD Overlay")
-    csv_df, weights, league_id, poll_secs, auto_refresh = sidebar_controls()
+    csv_df, weights, league_id, poll_secs, auto_refresh, username, seat = sidebar_controls()
 
     tabs = st.tabs(["Live Draft", "Mock Draft", "Player Board"])
     with tabs[0]:
-        live_tab(csv_df, weights, league_id, poll_secs, auto_refresh)
+        live_tab(csv_df, weights, league_id, poll_secs, auto_refresh, username, seat)
     with tabs[1]:
-        mock_tab(csv_df, weights)
+        mock_tab(csv_df, weights, seat)
     with tabs[2]:
         board_tab(csv_df, weights)
 
