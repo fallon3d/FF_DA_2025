@@ -1,32 +1,9 @@
-from .evaluation import evaluate_players, SCORING_DEFAULT
-from .sleeper import (
-    get_league,
-    get_drafts_for_league,
-    get_draft,
-    get_draft_picks,
-    get_rosters,
-    get_users_in_league,
-    get_players,
-    parse_mock_draft_id_from_url,
-)
-from .suggestions import suggest
-from .run_detection import detect_runs
-from .utils import norm_name, starters_from_roster_positions, apply_flex_adjustment
+"""
+Core namespace package.
 
-__all__ = [
-    "evaluate_players",
-    "SCORING_DEFAULT",
-    "suggest",
-    "detect_runs",
-    "norm_name",
-    "starters_from_roster_positions",
-    "apply_flex_adjustment",
-    "get_league",
-    "get_drafts_for_league",
-    "get_draft",
-    "get_draft_picks",
-    "get_rosters",
-    "get_users_in_league",
-    "get_players",
-    "parse_mock_draft_id_from_url",
-]
+Intentionally avoid importing submodules here so callers can do:
+    from draft_assistant.core import sleeper, evaluation, suggestions, utils
+without triggering circular imports at package import time.
+"""
+# No eager imports here on purpose.
+__all__ = ["sleeper", "evaluation", "suggestions", "utils", "run_detection"]
