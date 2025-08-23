@@ -1,8 +1,15 @@
 import os
+import sys
 import time
 import pandas as pd
 import streamlit as st
-from requests_cache import CachedSession
+
+# --- ensure repo root is importable when running a file inside the package ---
+# e.g. Streamlit Cloud may run from a different CWD
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+# ---------------------------------------------------------------------------
 
 from draft_assistant.core import sleeper
 from draft_assistant.core.evaluation import evaluate_players, SCORING_DEFAULT
