@@ -246,11 +246,11 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh, username, seat
     colr1, colr2 = st.columns([1, 1])
     with colr1:
         if st.button("🔄 Pull latest from Sleeper"):
-            st.experimental_rerun()
+            st.rerun()
     with colr2:
         if auto_refresh:
             time.sleep(poll_secs)
-            st.experimental_rerun()
+            st.rerun()
 
 def mock_tab(csv_df, weights, seat):
     st.subheader("Mock Draft (Sleeper URL)")
@@ -313,7 +313,7 @@ def mock_tab(csv_df, weights, seat):
     st.dataframe(avail_df[show_cols].sort_values(["VBD", "EVAL_PTS"], ascending=False), use_container_width=True)
 
     if force:
-        st.experimental_rerun()
+        st.rerun()
 
 def board_tab(csv_df, weights):
     st.subheader("Player Board & Filters")
