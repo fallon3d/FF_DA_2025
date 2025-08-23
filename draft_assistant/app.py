@@ -28,6 +28,9 @@ DEFAULT_CSV_PATH = os.environ.get("FFDA_CSV_PATH", "")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# === QB roster cap (env overrideable) ===
+QB_ROSTER_CAP = int(os.environ.get("FFDA_QB_CAP", "2"))
+
 # =========================
 # Caching
 # =========================
@@ -96,6 +99,25 @@ def compute_next_pick_window(teams: int, seat: int, current_overall_pick: int) -
         return my_pos_this - pos
     my_pos_next = (teams - seat + 1) if rnd % 2 == 1 else seat
     return (teams - pos) + my_pos_next
+
+def _apply_qb_cap_to_suggestions(sugg_df: pd.DataFrame, qb_have: int, qb_cap: int) -> pd.DataFrame:
+    """
+    Enforce a hard roster cap on QB suggestions.
+    - If qb_have >= qb_cap: hide all QBs.
+    - Else show at most (qb_cap - qb_have) QBs within the suggestions list.
+    """
+    if sugg_df is None or sugg_df.empty:
+        return sugg_df
+    remaining = max(0, qb_cap - max(0, qb_have))
+    qbs = sugg_df[sugg_df["POS"] == "QB"]
+    non_qbs = sugg_df[sugg_df["POS"] != "QB"]
+    if remaining <= 0:
+        return non_qbs.head(len(sugg_df)).reset_index(drop=True)
+    # keep the list order as given by `suggest(...)`
+    capped_qbs = qbs.head(remaining)
+    combined = pd.concat([non_qbs, capped_qbs], ignore_index=True)
+    # keep topk size the same as input
+    return combined.head(len(sugg_df)).reset_index(drop=True)
 
 # =========================
 # LIVE TAB
@@ -196,7 +218,12 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         want = max(1, want)  # at least 1
         need[pos] = max(0, (want + 1) - my_pos_counts.get(pos,0))
 
+    # Rank suggestions (top 8)
     sugg = suggest(avail_df, need, weights, topk=8)
+
+    # === Enforce QB cap in suggestions ===
+    qb_have = int(my_pos_counts.get("QB", 0))
+    sugg = _apply_qb_cap_to_suggestions(sugg, qb_have=qb_have, qb_cap=QB_ROSTER_CAP)
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -213,6 +240,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     with st.expander("Debug (Live)"):
         st.caption(f"Total picks fetched: {total_picks}")
         st.caption(f"My slot (auto/fallback): {my_slot}")
+        st.caption(f"QB have / cap: {qb_have} / {QB_ROSTER_CAP}")
         if picks:
             st.json(picks[0])
 
@@ -231,6 +259,9 @@ def mock_tab(csv_df, weights):
     reload_btn = c1.button("Load / Re-sync Mock")
     clear_btn = c2.button("Reset Practice")
     force_btn = c3.button("🔄 Pull latest picks (Mock)")
+
+    # Practice-only: let you indicate how many QBs you've already taken
+    qb_have_practice = st.number_input("QBs drafted (practice)", min_value=0, max_value=QB_ROSTER_CAP, value=0, step=1)
 
     if clear_btn:
         st.session_state.pop("mock_state", None)
@@ -321,6 +352,8 @@ def mock_tab(csv_df, weights):
 
     st.markdown("### Suggested Picks (Top 8)")
     sugg = suggest(S["available"], {"QB":1,"RB":2,"WR":2,"TE":1}, weights, topk=8)
+    # === Enforce QB cap in suggestions (practice) ===
+    sugg = _apply_qb_cap_to_suggestions(sugg, qb_have=qb_have_practice, qb_cap=QB_ROSTER_CAP)
     st.dataframe(sugg.drop(columns=["PLAYER_KEY"]), use_container_width=True)
 
     st.markdown("### Player Board (Available)")
@@ -329,6 +362,7 @@ def mock_tab(csv_df, weights):
 
     with st.expander("Debug (Mock)"):
         st.caption(f"Fetched picks: {len(picks)}")
+        st.caption(f"QB have (practice) / cap: {qb_have_practice} / {QB_ROSTER_CAP}")
         if picks:
             st.json(picks[0])
 
