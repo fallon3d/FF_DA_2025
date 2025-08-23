@@ -1,7 +1,7 @@
 from __future__ import annotations
 import io
 import re
-from typing import Dict, List, Iterable, Union
+from typing import Dict, List, Iterable, Union, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -116,7 +116,7 @@ def read_player_table(path_or_buffer: Union[str, io.BytesIO, io.BufferedReader])
 # Draft math & roster helpers
 # -----------------------------
 
-def snake_position(overall_pick: int, teams: int) -> tuple[int,int,int]:
+def snake_position(overall_pick: int, teams: int) -> Tuple[int,int,int]:
     """Return (round, pick_in_round, slot_on_clock) for serpentine draft."""
     rnd = (overall_pick - 1) // teams + 1
     pick_in_round = (overall_pick - 1) % teams + 1
@@ -129,25 +129,58 @@ def snake_position(overall_pick: int, teams: int) -> tuple[int,int,int]:
 def slot_for_round_pick(round_num: int, pick_in_round: int, teams: int) -> int:
     """Compute slot for a (round, pick) in a snake draft."""
     if round_num % 2 == 1:
-        return pick_in_round
-    return teams - pick_in_round + 1
+        return int(pick_in_round)
+    return int(teams) - int(pick_in_round) + 1
 
-def user_roster_id(users: List[dict], username: str) -> int | None:
-    """Find the user's roster_id by matching display_name case-insensitively."""
-    if not users or not username:
+# -----------------------------
+# User/roster mapping (Live)
+# -----------------------------
+
+def user_id_by_display_name(users: List[dict], display_name: str) -> Optional[str]:
+    if not users or not display_name:
         return None
-    u = str(username).strip().lower()
-    for item in users:
-        if str(item.get("display_name","")).strip().lower() == u:
-            # Sleeper user object also includes 'user_id'; roster_id is per league
-            return item.get("roster_id")
+    target = display_name.strip().lower()
+    for u in users:
+        if str(u.get("display_name","")).strip().lower() == target:
+            return u.get("user_id")
     return None
 
-def slot_to_display_name(slot: int, users: List[dict]) -> str:
-    """Map slot/roster_id to a display name, else 'Slot N'."""
-    for item in users or []:
-        if str(item.get("roster_id")) == str(slot):
-            return item.get("display_name") or f"Slot {slot}"
+def roster_id_for_user(rosters: List[dict], user_id: str) -> Optional[int]:
+    if not rosters or not user_id:
+        return None
+    for r in rosters:
+        if str(r.get("owner_id")) == str(user_id):
+            return r.get("roster_id")
+    return None
+
+def user_roster_id(users: List[dict], rosters: List[dict], username: str) -> Optional[int]:
+    """Preferred way: display_name -> user_id -> roster_id (slot)."""
+    uid = user_id_by_display_name(users, username)
+    if not uid:
+        return None
+    return roster_id_for_user(rosters, uid)
+
+def slot_to_display_name(slot: int, users: List[dict], rosters: Optional[List[dict]] = None) -> str:
+    """
+    Map slot/roster_id to a display name.
+    Tries rosters (owner_id -> user_id -> users.display_name); falls back to users.roster_id; else "Slot N".
+    """
+    if rosters:
+        owner = None
+        for r in rosters:
+            if str(r.get("roster_id")) == str(slot):
+                owner = r.get("owner_id")
+                break
+        if owner:
+            for u in users or []:
+                if str(u.get("user_id")) == str(owner):
+                    return u.get("display_name") or f"Slot {slot}"
+
+    # Fallback: some installs include roster_id on user objects
+    for u in users or []:
+        if str(u.get("roster_id")) == str(slot):
+            return u.get("display_name") or f"Slot {slot}"
+
     return f"Slot {slot}"
 
 def remove_players_by_name(df: pd.DataFrame, names: Iterable[str]) -> pd.DataFrame:
