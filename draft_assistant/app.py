@@ -109,11 +109,12 @@ def compute_next_pick_window(teams: int, seat: int, current_overall_pick: int) -
 def _pos_from_meta(p: dict) -> str:
     return str((p.get("metadata") or {}).get("position") or "").upper().replace("DST","DEF")
 
-def _team_pos_counts_from_picks(picks: List[dict], teams: int) -> Dict[int, Dict[str,int]]:
+def _team_pos_counts_from_log(pick_log: List[dict], teams: int) -> Dict[int, Dict[str,int]]:
+    # pick_log must be from sleeper.picks_to_internal_log()
     counts = {slot: {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0} for slot in range(1, teams+1)}
-    for p in picks or []:
+    for p in pick_log or []:
         try:
-            slot = int(p.get("slot") or p.get("roster_id") or 0)
+            slot = int(p.get("slot") or 0)
         except Exception:
             slot = 0
         if not (1 <= slot <= teams):
@@ -187,8 +188,8 @@ def _reason_plain_english(row: pd.Series, need_for_pos: int, prob_back: float, n
         bits.append(f"Bye {int(row['BYE'])}.")
     return " ".join(bits)
 
-def _recent_runs(picks: List[dict], window: int = 8) -> Dict[str,int]:
-    tail = (picks or [])[-window:]
+def _recent_runs(pick_log: List[dict], window: int = 8) -> Dict[str,int]:
+    tail = (pick_log or [])[-window:]
     counts = {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0}
     for p in tail:
         pos = _pos_from_meta(p)
@@ -221,12 +222,11 @@ def _ensure_k_def_in_suggestions(
     need_k: int,
     need_def: int,
 ) -> pd.DataFrame:
-    if sugg_df is None or sugg_df.empty: 
+    if sugg_df is None or sugg_df.empty:
         return sugg_df
     have_k = (sugg_df["POS"]=="K").any()
     have_d = (sugg_df["POS"]=="DEF").any()
 
-    # Force K/DEF in the final two rounds if still needed
     force_window = rnd >= total_rounds - 1 or (rnd >= total_rounds - 2 and (need_k > 0 or need_def > 0))
     want_force = force_window
 
@@ -267,7 +267,6 @@ STRATS = [
     "Zero RB", "Modified Zero RB", "Hero RB", "Robust RB",
     "Hyper-Fragile RB", "WR-Heavy", "Pocket QB", "Bimodal RB", "Balanced"
 ]
-# >>> Include K and DEF targets (1 each) <<<
 STRAT_TARGETS = {
     "Zero RB":         {"RB":5, "WR":7, "TE":1, "QB":1, "K":1, "DEF":1},
     "Modified Zero RB":{"RB":4, "WR":7, "TE":1, "QB":1, "K":1, "DEF":1},
@@ -281,9 +280,6 @@ STRAT_TARGETS = {
 }
 
 def _make_base_plan(name: str, rnd: int, total_rounds: int, my_counts: Dict[str,int]) -> Dict[int, str]:
-    """
-    Build a base plan (without K/DEF reservations), capped to total_rounds and only forward-looking.
-    """
     end_round = min(total_rounds, rnd + 5)
     plan: Dict[int, str] = {}
     for i in range(rnd, end_round + 1):
@@ -314,26 +310,17 @@ def _reserve_last_rounds_for_k_def(
     my_counts: Dict[str,int],
     targets: Dict[str,int]
 ) -> Dict[int,str]:
-    """
-    Ensure the final rounds include DEF then K if you still need them.
-    This never creates rounds > total_rounds and only overwrites the last rounds.
-    """
     need_def = max(0, targets.get("DEF",1) - my_counts.get("DEF",0))
     need_k   = max(0, targets.get("K",1)   - my_counts.get("K",0))
     if total_rounds < 1:
         return plan.copy()
-
     new_plan = plan.copy()
     last = total_rounds
     second_last = total_rounds - 1
-
-    # Reserve DEF at R-1 (second_last) if needed
     if need_def > 0 and second_last >= 1:
         new_plan[second_last] = "DEF"
-    # Reserve K at R (last) if needed
     if need_k > 0 and last >= 1:
         new_plan[last] = "K"
-
     return new_plan
 
 def score_strategies(
@@ -376,7 +363,6 @@ def score_strategies(
             if run_boost_wr >= 3: score -= 6
             if my_counts.get("RB",0) >= 1: score -= 5
             why_bits.append("Pass-catchers show early VBD edge; delay RB.")
-
         elif name == "Modified Zero RB":
             score += max(0.0, (max(wr_edge, te_edge) - rb_edge)) * 0.7
             score += (wr_depth + te_depth) * 0.5
@@ -384,48 +370,41 @@ def score_strategies(
             if rnd <= 3: score += 7
             if my_counts.get("RB",0) == 0 and long_wrap: score += 4
             why_bits.append("Pass-catchers now; mid-round RB pocket later.")
-
         elif name == "Hero RB":
             score += max(0.0, (rb_edge - max(wr_edge, te_edge))) * 1.1
             if my_counts.get("RB",0) == 0 and rnd <= 2: score += 10
             if run_boost_rb >= 2: score -= 4
             why_bits.append("One elite RB projects a large VBD lead.")
-
         elif name == "Robust RB":
             score += max(0.0, (rb_edge - max(wr_edge, te_edge))) * 0.9
             if early_turn or long_wrap: score += 6
             if my_counts.get("RB",0) <= 1 and rnd <= 3: score += 7
             if run_boost_rb >= 3: score -= 6
             why_bits.append("Multiple bell-cow RBs at good prices.")
-
         elif name == "Hyper-Fragile RB":
             if my_counts.get("RB",0) >= 2 and rnd <= 6: score += 12
             if my_counts.get("RB",0) == 3: score += 6
             if rb_edge <= max(wr_edge, te_edge): score += 5
             why_bits.append("After 2–3 RBs, shift to WR/TE for depth.")
-
         elif name == "WR-Heavy":
             score += max(0.0, (wr_edge - max(rb_edge, te_edge))) * 1.0
             score += wr_depth * 0.7
             if rnd <= 3: score += 8
             if run_boost_wr >= 3: score -= 6
             why_bits.append("WR tiers deeper and stronger than RB.")
-
         elif name == "Pocket QB":
             if rnd <= 5 and qb_edge < max(wr_edge, rb_edge, te_edge) + 5:
                 score += 10
             score += max(0.0, qb_edge - (max(wr_edge, rb_edge, te_edge) - 5)) * 0.4
             why_bits.append("Pass QB until the pocket beats other positions.")
-
         elif name == "Bimodal RB":
             score += max(0, rb_depth - 4) * 1.0
             if rnd in (4,5,6): score += 6
             why_bits.append("Two mid-round RBs can outscore early+late combo.")
-
         else:
             score += (wr_edge + rb_edge + te_edge) * 0.2
             why_bits.append("Board fairly even; take best value with needs.")
-            score -= 6.0  # gentle penalty unless truly best
+            score -= 6.0
 
         base = _make_base_plan(name, rnd, total_rounds, my_counts)
         plan = _reserve_last_rounds_for_k_def(base, total_rounds, my_counts, STRAT_TARGETS[name])
@@ -440,7 +419,6 @@ def render_strategy_panel(current: Dict[str,object], targets: Dict[str,int], tot
         st.caption(current["why"])
         plan = current.get("plan") or {}
         if plan:
-            # show only forward-looking next 6 rounds and within total_rounds
             rounds = sorted([r for r in plan.keys() if r <= total_rounds])
             if rounds:
                 head = rounds[:6]
@@ -464,21 +442,17 @@ def render_strategy_health(my_counts: Dict[str,int], targets: Dict[str,int], pla
     with st.container(border=True):
         st.markdown("**Strategy Health**")
         st.table(df)
-        # Sanity checks
+        # sanity checks
         msgs = []
-        rounds_in_plan = sorted(plan.keys())
-        if rounds_in_plan and rounds_in_plan[-1] > total_rounds:
-            msgs.append(f"Plan had rounds > total ({rounds_in_plan[-1]}). Capped at {total_rounds}.")
-        if remain["DEF"] > 0 and (total_rounds not in plan.values() and "DEF" not in [plan.get(total_rounds-1), plan.get(total_rounds)]):
+        if remain["DEF"] > 0 and (plan.get(total_rounds-1) != "DEF" and plan.get(total_rounds) != "DEF"):
             msgs.append("DEF not yet reserved in last rounds—will force in suggestions.")
-        if remain["K"] > 0 and ("K" not in plan.values()):
+        if remain["K"] > 0 and (plan.get(total_rounds) != "K"):
             msgs.append("K not yet reserved in last rounds—will force in suggestions.")
-        if msgs:
-            for m in msgs:
-                st.warning(m)
+        for m in msgs:
+            st.warning(m)
 
 # =========================
-# Live tab
+# Live tab (Suggested Picks on top; no Player Board)
 # =========================
 
 def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, auto_live, include_k_def_anytime):
@@ -526,13 +500,15 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     st.write(f"**League:** {league_name}  |  **Draft ID:** `{draft_id}`")
 
     try:
-        picks = sleeper.get_picks(draft_id) or []
+        raw_picks = sleeper.get_picks(draft_id) or []
         players_map = sleeper_players_cache()
+        # Normalize picks to stable structure (ensures accurate owned counts)
+        pick_log = sleeper.picks_to_internal_log(raw_picks, players_map, teams) or []
     except Exception as e:
         st.error(f"Failed to load picks/players: {e}")
         return
 
-    total_picks = len(picks)
+    total_picks = len(pick_log)
     next_overall = total_picks + 1
     rnd, pick_in_rnd, slot_on_clock = snake_position(next_overall, teams)
     team_display = slot_to_display_name(slot_on_clock, users, rosters)
@@ -550,7 +526,8 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         st.warning("Upload/load your player file in the sidebar.")
         return
 
-    picked_names = sleeper.picked_player_names(picks, players_map)
+    # Availability
+    picked_names = sleeper.picked_player_names(raw_picks, players_map)
     taken_keys = [norm_name(n) for n in picked_names]
     picks_until_next = compute_next_pick_window(teams, my_slot, next_overall)
     avail_df, _ = evaluate_players(
@@ -558,7 +535,8 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         current_picks=taken_keys, next_pick_window=picks_until_next
     )
 
-    team_counts = _team_pos_counts_from_picks(picks, teams)
+    # Owned counts (from normalized log) — fixes Strategy Health
+    team_counts = _team_pos_counts_from_log(pick_log, teams)
     my_counts = team_counts.get(my_slot, {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0})
 
     my_next_overall = next_overall + picks_until_next
@@ -568,36 +546,33 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         p: (sum(1 for s in between_slots if needs.get(s, {}).get(p, 0) > 0) / max(1, len(between_slots)))
         for p in ["QB","RB","WR","TE","K","DEF"]
     }
-    runs = _recent_runs(picks, window=8)
+    runs = _recent_runs(pick_log, window=8)
 
     # -------- Dynamic strategy (recomputed each pick) --------
     strat_ranked = score_strategies(avail_df, my_counts, starters, rnd, teams, my_slot, picks_until_next, runs, rounds_total)
     current = strat_ranked[0]
     targets = STRAT_TARGETS.get(current["name"], STRAT_TARGETS["Balanced"])
-    render_strategy_panel(current, targets, rounds_total)
-    render_strategy_health(my_counts, targets, current.get("plan", {}), rounds_total)
 
-    # Build needs baseline from targets (how many more to reach the target)
+    # ===== Suggested Picks FIRST (top of screen) =====
     base_need = {"QB":0,"RB":0,"WR":0,"TE":0}
     for pos in base_need:
         want = max(1, targets.get(pos, 0))
         base_need[pos] = max(0, want - my_counts.get(pos, 0))
 
-    # Suggestions
     sugg = suggest(avail_df, base_need, weights, topk=8)
 
     # QB cap
     qb_have = int(my_counts.get("QB", 0))
     sugg = _apply_qb_cap(sugg, qb_have, QB_ROSTER_CAP)
 
-    # Ensure K/DEF appear as needed (especially in the last two rounds)
+    # Ensure K/DEF appear as needed (esp. last two rounds)
     need_k = max(0, targets.get("K",1) - my_counts.get("K",0))
     need_def = max(0, targets.get("DEF",1) - my_counts.get("DEF",0))
     sugg = _ensure_k_def_in_suggestions(
         sugg, avail_df, rnd, rounds_total, include_k_def_anytime, need_k, need_def
     )
 
-    # If run/tier cliff nuked target edges, pivot this pick
+    # Pivot for this pick if run/tier cliff erases edge
     if not sugg.empty:
         top_pos = sugg.iloc[0]["POS"]
         depth_top, edge_top = _tier_depth(avail_df, top_pos)
@@ -608,7 +583,8 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
                 st.info("Run/tier cliff detected — pivoting to best overall VBD for this pick.")
                 sugg = sugg.sort_values(["VBD","EVAL_PTS"], ascending=False).head(8)
 
-    # Display suggestions
+    # Display Suggested Picks (top)
+    st.markdown("### Suggested Picks (Top 8)")
     disp_rows = []
     for _, row in sugg.iterrows():
         pos = row["POS"]
@@ -632,24 +608,24 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
             "Why this pick": reason
         })
     disp_df = pd.DataFrame(disp_rows)
+    if disp_df.empty:
+        st.info("No candidates available.")
+    else:
+        st.dataframe(disp_df, use_container_width=True, height=420)
 
-    col1, col2 = st.columns([1.25, 1])
-    with col1:
-        st.markdown("### Suggested Picks (Top 8)")
-        if disp_df.empty:
-            st.info("No candidates available.")
-        else:
-            st.dataframe(disp_df, use_container_width=True, height=420)
-    with col2:
-        st.markdown("### Player Board (Available)")
-        show_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","INJURY_RISK","SOS_SEASON"]
-        st.dataframe(
-            avail_df[show_cols].sort_values(["VBD","EVAL_PTS"], ascending=False),
-            use_container_width=True, height=420
-        )
+    # Strategy panel (below suggestions)
+    render_strategy_panel(current, targets, rounds_total)
+    render_strategy_health(my_counts, targets, current.get("plan", {}), rounds_total)
+
+    # Debug
+    with st.expander("Debug (Live)"):
+        st.caption(f"Picks fetched: {len(pick_log)} (normalized)")
+        st.caption(f"My slot: {my_slot} | On clock slot: {slot_on_clock}")
+        st.caption(f"Picks until next: {picks_until_next} | Recent runs: {runs}")
+        st.caption(f"Owned counts: {my_counts}")
 
 # =========================
-# Mock tab
+# Mock tab (unchanged layout; board remains here)
 # =========================
 
 def mock_tab(csv_df, weights, include_k_def_anytime):
@@ -749,17 +725,15 @@ def mock_tab(csv_df, weights, include_k_def_anytime):
 
     # Strategy (dynamic) for mock too
     my_counts = {"QB":qb_have_practice,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0}
-    runs = _recent_runs(picks, window=8)
+    runs = _recent_runs(sleeper.picks_to_internal_log(picks, players_map, teams), window=8)
     strat_ranked = score_strategies(avail_df, my_counts, starters, rnd, teams, slot_on_clock, teams, runs, rounds)
     current = strat_ranked[0]
     targets = STRAT_TARGETS.get(current["name"], STRAT_TARGETS["Balanced"])
-    render_strategy_panel(current, targets, rounds)
-    render_strategy_health(my_counts, targets, current.get("plan", {}), rounds)
 
+    # Suggestions
     base_need = {"QB":1,"RB":2,"WR":2,"TE":1}
     for pos in base_need:
         base_need[pos] = max(1, targets.get(pos, base_need[pos]))
-
     sugg = suggest(S["available"], base_need, weights, topk=8)
     sugg = _apply_qb_cap(sugg, qb_have_practice, QB_ROSTER_CAP)
 
@@ -769,13 +743,13 @@ def mock_tab(csv_df, weights, include_k_def_anytime):
         sugg, S["available"], rnd, rounds, include_k_def_anytime, need_k, need_def
     )
 
-    demand_ratio = {p: 0.5 for p in ["QB","RB","WR","TE","K","DEF"]}
-
+    # Display
+    st.markdown("### Suggested Picks (Top 8)")
     disp_rows = []
     for _, row in sugg.iterrows():
         pos = row["POS"]
         prob_back = _make_it_back_probability(
-            row, picks_until_next=teams, demand_ratio=demand_ratio.get(pos,0.5), current_overall=next_overall
+            row, picks_until_next=teams, demand_ratio=0.5, current_overall=next_overall
         )
         reason = _reason_plain_english(row, need_for_pos=1 if pos in ("QB","TE","K","DEF") else 2, prob_back=prob_back, next_picks=teams)
         disp_rows.append({
@@ -789,19 +763,16 @@ def mock_tab(csv_df, weights, include_k_def_anytime):
             "Make it back": f"{prob_back*100:.0f}%",
             "Why this pick": reason
         })
-    disp_df = pd.DataFrame(disp_rows)
+    st.dataframe(pd.DataFrame(disp_rows), use_container_width=True, height=420)
 
-    col1, col2 = st.columns([1.25, 1])
-    with col1:
-        st.markdown("### Suggested Picks (Top 8)")
-        if disp_df.empty:
-            st.info("No candidates available.")
-        else:
-            st.dataframe(disp_df, use_container_width=True, height=420)
-    with col2:
-        st.markdown("### Player Board (Available)")
-        show_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","INJURY_RISK","SOS_SEASON"]
-        st.dataframe(S["available"][show_cols].sort_values(["VBD","EVAL_PTS"], ascending=False), use_container_width=True)
+    # Strategy panel/health (mock)
+    render_strategy_panel(current, targets, rounds)
+    render_strategy_health(my_counts, targets, current.get("plan", {}), rounds)
+
+    # Board (kept only in mock)
+    st.markdown("### Player Board (Available)")
+    show_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","INJURY_RISK","SOS_SEASON"]
+    st.dataframe(S["available"][show_cols].sort_values(["VBD","EVAL_PTS"], ascending=False), use_container_width=True)
 
 # =========================
 # Board tab
