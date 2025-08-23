@@ -1,100 +1,130 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
 import httpx
+from .utils import norm_name, slot_for_round_pick  # for picks_to_internal_log
 
-# Public, read-only Sleeper API
 BASE = "https://api.sleeper.app/v1"
+_UA = {"User-Agent": "FF_DA_2025 (github.com/fallon3d/FF_DA_2025)"}
 
-_DEFAULT_HEADERS = {
-    "User-Agent": "FF_DA_2025 (https://github.com/fallon3d/FF_DA_2025)"
-}
-
-def _get(path: str, timeout: float = 15.0) -> Any:
-    """
-    Lightweight GET helper. Raises httpx.HTTPStatusError on non-2xx.
-    """
+def _get(path: str, timeout: float = 20.0) -> Any:
     url = f"{BASE}{path}"
-    with httpx.Client(timeout=timeout, headers=_DEFAULT_HEADERS) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        return resp.json()
+    with httpx.Client(timeout=timeout, headers=_UA) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        return r.json()
 
-# -------------------------------
-# League / Draft endpoints
-# -------------------------------
+# -------- Core endpoints --------
 
-def get_league(league_id: str) -> Dict[str, Any]:
-    """
-    League metadata: roster_positions, scoring_settings, draft_id, total_rosters, etc.
-    https://docs.sleeper.com/#getting-started
-    """
+def get_league_info(league_id: str) -> Dict[str, Any]:
     return _get(f"/league/{league_id}")
 
 def get_drafts_for_league(league_id: str) -> List[dict]:
-    """
-    All drafts associated with the league (current + past).
-    """
     return _get(f"/league/{league_id}/drafts")
 
 def get_draft(draft_id: str) -> Dict[str, Any]:
-    """
-    Single draft metadata (status: pre_draft, in_progress, complete).
-    """
     return _get(f"/draft/{draft_id}")
 
-def get_draft_picks(draft_id: str) -> List[dict]:
-    """
-    List of picks for a draft. Each entry includes:
-      - player_id, picked_by (user_id), round, pick_no, metadata (names/pos), etc.
-    """
+def get_picks(draft_id: str) -> List[dict]:
     return _get(f"/draft/{draft_id}/picks")
 
-def get_rosters(league_id: str) -> List[dict]:
-    """
-    Rosters (players) by team for the league.
-    """
-    return _get(f"/league/{league_id}/rosters")
-
-def get_users_in_league(league_id: str) -> List[dict]:
-    """
-    Users (managers) in the league with display_name and user_id.
-    """
+def get_users(league_id: str) -> List[dict]:
     return _get(f"/league/{league_id}/users")
 
-# -------------------------------
-# Players dump
-# -------------------------------
-
-def get_players() -> Dict[str, Any]:
-    """
-    Full NFL players dump (large JSON). Keyed by Sleeper player_id (string).
-    Each entry can include:
-      first_name, last_name, full_name, position, team, injury_status, etc.
-    Fetch once per session and cache in the app with @st.cache_resource.
-    """
+def get_players_nfl() -> Dict[str, Any]:
+    # Big payload; cache with @st.cache_resource on the caller
     return _get("/players/nfl")
 
-# -------------------------------
-# Helpers
-# -------------------------------
+# -------- Helpers for mocks & names --------
 
-def parse_mock_draft_id_from_url(url: str) -> Optional[str]:
+def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
     """
-    Accepts typical Sleeper mock URLs:
-      - https://sleeper.com/draft/nfl/<draft_id>
-      - https://sleeper.app/draft/nfl/<draft_id>
-    Falls back to the last long integer-like token if structure differs.
+    Accepts:
+      - Full URLs (sleeper.com or sleeper.app), with or without '/nfl' segment
+      - Bare draft_id (all digits, length >= 10)
     """
-    if not url:
+    if not url_or_id:
         return None
-    parts = url.strip("/").split("/")
-    # Look for ".../draft/nfl/<id>"
+    s = url_or_id.strip()
+    # Bare id
+    if s.isdigit() and len(s) >= 10:
+        return s
+    parts = s.strip("/").split("/")
+    # Look for ".../draft/<maybe nfl>/<id>"
     for i, p in enumerate(parts):
-        if p == "draft" and i + 2 < len(parts):
-            # parts[i+1] is expected to be 'nfl'
-            return parts[i + 2]
-    # Fallback: last integer-looking segment with length >= 12
+        if p == "draft":
+            # next is possibly 'nfl' then id
+            if i + 2 < len(parts) and parts[i+1].lower() == "nfl":
+                return parts[i+2]
+            if i + 1 < len(parts):
+                return parts[i+1]
+    # Fallback last numeric token
     for p in reversed(parts):
-        if p.isdigit() and len(p) >= 12:
+        if p.isdigit() and len(p) >= 10:
             return p
     return None
+
+def picked_player_names(picks: List[dict], players_map: Dict[str, Any]) -> List[str]:
+    """
+    Resolve picked player full names using the official players dump when available.
+    Falls back to pick metadata names.
+    """
+    out: List[str] = []
+    for p in picks or []:
+        meta = p.get("metadata") or {}
+        pid = str(p.get("player_id") or meta.get("player_id") or "").strip()
+        name = None
+        if pid and pid in players_map:
+            info = players_map.get(pid) or {}
+            name = info.get("full_name") or f"{info.get('first_name','')} {info.get('last_name','')}".strip()
+        if not name:
+            name = (
+                meta.get("full_name")
+                or meta.get("player")
+                or f"{meta.get('first_name','')} {meta.get('last_name','')}".strip()
+            )
+        if name:
+            out.append(name.strip())
+    return out
+
+def picks_to_internal_log(picks: List[dict], players_map: Dict[str, Any], teams: int) -> List[dict]:
+    """
+    Convert Sleeper picks to a simplified, consistent log:
+      { round, pick_no, slot, roster_id, metadata: {first_name,last_name,position,full_name} }
+    If 'slot' (roster_id) is missing, compute from (round, pick_no) + teams.
+    """
+    log: List[dict] = []
+    for p in picks or []:
+        meta = p.get("metadata") or {}
+        rnd = int(p.get("round", 0) or 0)
+        pick_no = int(p.get("pick_no", 0) or 0)
+        roster_id = p.get("roster_id")
+        slot = p.get("slot") or roster_id
+        if not slot and rnd and pick_no and teams:
+            slot = slot_for_round_pick(rnd, pick_no, teams)
+        pid = str(p.get("player_id") or meta.get("player_id") or "")
+        # names
+        full_name = None
+        if pid and pid in players_map:
+            info = players_map.get(pid) or {}
+            full_name = info.get("full_name") or f"{info.get('first_name','')} {info.get('last_name','')}".strip()
+            pos = info.get("position") or meta.get("position")
+        else:
+            pos = meta.get("position")
+            full_name = (
+                meta.get("full_name")
+                or meta.get("player")
+                or f"{meta.get('first_name','')} {meta.get('last_name','')}".strip()
+            )
+        log.append({
+            "round": rnd,
+            "pick_no": pick_no,
+            "slot": int(slot) if slot else None,
+            "roster_id": roster_id,
+            "metadata": {
+                "first_name": (full_name or "").split(" ")[0] if full_name else "",
+                "last_name": " ".join((full_name or "").split(" ")[1:]) if full_name else "",
+                "full_name": full_name,
+                "position": pos,
+            },
+        })
+    return log
