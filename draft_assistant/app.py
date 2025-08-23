@@ -1,7 +1,7 @@
 import os
 import sys
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import pandas as pd
 import streamlit as st
 
@@ -19,7 +19,6 @@ from draft_assistant.core.utils import (
     read_player_table,
     snake_position,
     starters_from_roster_positions,
-    user_roster_id,
     slot_to_display_name,
 )
 
@@ -72,7 +71,7 @@ def sidebar_controls():
 
     st.sidebar.header("Sleeper (Live)")
     league_id = st.sidebar.text_input("League ID", value="")
-    username = st.sidebar.text_input("Your Sleeper username (optional)", value="Fallon3D")
+    username = st.sidebar.text_input("Your Sleeper username (or display name)", value="Fallon3D")
     seat = st.sidebar.number_input("Your draft slot (1–Teams; 0=auto)", min_value=0, max_value=20, value=0)
 
     poll_secs = st.sidebar.slider("Auto-refresh seconds", 3, 30, 5, 1)
@@ -110,7 +109,6 @@ def _pos_from_meta(p: dict) -> str:
     return str((p.get("metadata") or {}).get("position") or "").upper().replace("DST","DEF")
 
 def _team_pos_counts_from_log(pick_log: List[dict], teams: int) -> Dict[int, Dict[str,int]]:
-    # pick_log must be from sleeper.picks_to_internal_log()
     counts = {slot: {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0} for slot in range(1, teams+1)}
     for p in pick_log or []:
         try:
@@ -208,6 +206,48 @@ def _tier_depth(avail_df: pd.DataFrame, pos: str) -> Tuple[int, float]:
     depth = int(pool[pool["TIER"] == t].shape[0])
     edge = float(top.iloc[0].get("VBD", 0.0))
     return depth, edge
+
+# ---------- slot detection (fix for Strategy Health = 0) ----------
+def _resolve_user_id(users: List[dict], username_or_display: str) -> Optional[str]:
+    want = (username_or_display or "").strip().lower()
+    if not want:
+        return None
+    for u in users or []:
+        if str(u.get("username","")).lower() == want:
+            return u.get("user_id")
+        if str(u.get("display_name","")).lower() == want:
+            return u.get("user_id")
+    return None
+
+def _detect_my_slot(users: List[dict], draft_meta: dict, pick_log: List[dict], seat_override: int, username: str) -> int:
+    # 1) manual override
+    if int(seat_override) > 0:
+        return int(seat_override)
+
+    # 2) via draft.draft_order (user_id -> slot)
+    my_uid = _resolve_user_id(users, username)
+    draft_order = draft_meta.get("draft_order") if isinstance(draft_meta, dict) else None
+    if my_uid and isinstance(draft_order, dict):
+        slot = draft_order.get(my_uid)
+        if slot:
+            try:
+                return int(slot)
+            except Exception:
+                pass
+
+    # 3) via pick log (first pick with team == my user_id)
+    if my_uid:
+        for p in pick_log or []:
+            if str(p.get("team") or "") == str(my_uid):
+                try:
+                    s = int(p.get("slot", 0))
+                    if s > 0:
+                        return s
+                except Exception:
+                    pass
+
+    # fallback
+    return 1
 
 # =========================
 # K/DEF + QB cap helpers
@@ -351,7 +391,6 @@ def score_strategies(
     long_wrap = picks_until_next >= teams // 2
 
     results = []
-
     for name in STRATS:
         score = 0.0
         why_bits = []
@@ -502,8 +541,8 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     try:
         raw_picks = sleeper.get_picks(draft_id) or []
         players_map = sleeper_players_cache()
-        # Normalize picks to stable structure (ensures accurate owned counts)
         pick_log = sleeper.picks_to_internal_log(raw_picks, players_map, teams) or []
+        draft_meta = sleeper.get_draft(draft_id) or {}
     except Exception as e:
         st.error(f"Failed to load picks/players: {e}")
         return
@@ -513,8 +552,8 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     rnd, pick_in_rnd, slot_on_clock = snake_position(next_overall, teams)
     team_display = slot_to_display_name(slot_on_clock, users, rosters)
 
-    auto_slot = user_roster_id(users, rosters, username) or 0
-    my_slot = int(seat_override) if int(seat_override) > 0 else (auto_slot or 1)
+    # >>> Robust slot resolution <<<
+    my_slot = _detect_my_slot(users, draft_meta, pick_log, seat_override, username)
     you_on_clock = (slot_on_clock == my_slot)
 
     st.markdown(
@@ -526,7 +565,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         st.warning("Upload/load your player file in the sidebar.")
         return
 
-    # Availability
+    # Availability (remove drafted by name)
     picked_names = sleeper.picked_player_names(raw_picks, players_map)
     taken_keys = [norm_name(n) for n in picked_names]
     picks_until_next = compute_next_pick_window(teams, my_slot, next_overall)
@@ -535,7 +574,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         current_picks=taken_keys, next_pick_window=picks_until_next
     )
 
-    # Owned counts (from normalized log) — fixes Strategy Health
+    # Owned counts from normalized log — now keyed by true slot
     team_counts = _team_pos_counts_from_log(pick_log, teams)
     my_counts = team_counts.get(my_slot, {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0})
 
@@ -619,13 +658,13 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
 
     # Debug
     with st.expander("Debug (Live)"):
-        st.caption(f"Picks fetched: {len(pick_log)} (normalized)")
-        st.caption(f"My slot: {my_slot} | On clock slot: {slot_on_clock}")
+        st.caption(f"Picks fetched (normalized): {len(pick_log)}")
+        st.caption(f"Resolved my_slot: {my_slot} | On clock slot: {slot_on_clock}")
         st.caption(f"Picks until next: {picks_until_next} | Recent runs: {runs}")
-        st.caption(f"Owned counts: {my_counts}")
+        st.caption(f"Owned counts (my team): {my_counts}")
 
 # =========================
-# Mock tab (unchanged layout; board remains here)
+# Mock tab (kept board here)
 # =========================
 
 def mock_tab(csv_df, weights, include_k_def_anytime):
@@ -769,7 +808,7 @@ def mock_tab(csv_df, weights, include_k_def_anytime):
     render_strategy_panel(current, targets, rounds)
     render_strategy_health(my_counts, targets, current.get("plan", {}), rounds)
 
-    # Board (kept only in mock)
+    # Keep board in mock tab
     st.markdown("### Player Board (Available)")
     show_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","INJURY_RISK","SOS_SEASON"]
     st.dataframe(S["available"][show_cols].sort_values(["VBD","EVAL_PTS"], ascending=False), use_container_width=True)
