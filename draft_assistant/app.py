@@ -17,7 +17,7 @@ from draft_assistant.core.utils import (
     norm_name,
     read_player_table,
     snake_position,
-    user_roster_id,
+    user_roster_id,          # uses users + rosters + username
     slot_to_display_name,
     remove_players_by_name,
 )
@@ -56,7 +56,6 @@ def sidebar_controls():
     if src == "Upload":
         up = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
         if up is not None:
-            # read_player_table handles both CSV & Excel
             csv_df = read_player_table(up)
     else:
         path = st.sidebar.text_input("CSV/Excel path", value=DEFAULT_CSV_PATH)
@@ -122,6 +121,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     try:
         league = sleeper.get_league_info(league_id)
         users = sleeper.get_users(league_id) or []
+        rosters = sleeper.get_rosters(league_id) or []
         drafts = sleeper.get_drafts_for_league(league_id) or []
     except Exception as e:
         st.error(f"Failed to load league/draft metadata: {e}")
@@ -157,10 +157,10 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     total_picks = len(picks)
     next_overall = total_picks + 1
     rnd, pick_in_rnd, slot_on_clock = snake_position(next_overall, teams)
-    team_display = slot_to_display_name(slot_on_clock, users)
+    team_display = slot_to_display_name(slot_on_clock, users, rosters)
 
-    # Identify your roster slot
-    auto_slot = user_roster_id(users, username) or 0
+    # Identify your roster slot (auto via rosters; fallback to sidebar seat)
+    auto_slot = user_roster_id(users, rosters, username) or 0
     my_slot = int(seat_override) if int(seat_override) > 0 else (auto_slot or 1)
     you_on_clock = (slot_on_clock == my_slot)
 
@@ -212,6 +212,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
 
     with st.expander("Debug (Live)"):
         st.caption(f"Total picks fetched: {total_picks}")
+        st.caption(f"My slot (auto/fallback): {my_slot}")
         if picks:
             st.json(picks[0])
 
@@ -242,6 +243,7 @@ def mock_tab(csv_df, weights):
     # Initial load / re-sync
     if reload_btn and url_or_id.strip():
         draft_id = sleeper.parse_draft_id_from_url(url_or_id.strip())
+        st.caption(f"Parsed draft_id: `{draft_id or 'None'}`")
         if not draft_id:
             st.error("Could not parse a draft_id from your input.")
         else:
@@ -250,15 +252,12 @@ def mock_tab(csv_df, weights):
                 teams = int(dmeta.get("settings", {}).get("teams", dmeta.get("teams", 12)) or 12)
                 rounds = int(dmeta.get("settings", {}).get("rounds", 15) or 15)
                 picks = sleeper.get_picks(draft_id) or []
-                users = dmeta.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams+1)]
                 players_map = sleeper_players_cache()
                 picked_names = sleeper.picked_player_names(picks, players_map)
                 taken_keys = [norm_name(n) for n in picked_names]
 
                 # Build initial available board using actual teams/rounds context
-                # Generic roster for mocks:
                 roster_positions = ["QB","RB","RB","WR","WR","TE","FLEX","K","DEF"]
-                # Use a copy of the csv_df; evaluate filters picks by key
                 avail_df, _ = evaluate_players(
                     csv_df, SCORING_DEFAULT, teams, roster_positions, weights, current_picks=taken_keys
                 )
@@ -267,7 +266,6 @@ def mock_tab(csv_df, weights):
                     "draft_id": draft_id,
                     "teams": teams,
                     "rounds": rounds,
-                    "users": users,
                     "picks": picks,
                     "available": avail_df.reset_index(drop=True),
                 }
@@ -284,7 +282,6 @@ def mock_tab(csv_df, weights):
     teams = int(S["teams"])
     rounds = int(S["rounds"])
     picks = S["picks"]
-    users = S["users"]
     players_map = sleeper_players_cache()
 
     next_overall = len(picks) + 1
