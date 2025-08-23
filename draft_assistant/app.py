@@ -1,347 +1,812 @@
-# FILE: pages/2_Rotation_Builder.py
-from __future__ import annotations
-from typing import Dict, List, Optional
-
+import os
+import sys
+import math
+from typing import Dict, List, Tuple
 import pandas as pd
 import streamlit as st
 
-from rotation_core.constants import positions_for, CATEGORY_MAP
-from rotation_core.models import Config, Player
-from rotation_core.assignment import assign_one_rotation
-from rotation_core.suitability import preference_rank
-from rotation_core.io import generate_cards
+# --- ensure repo root is importable when running from package path ---
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+# --------------------------------------------------------------------
 
-st.title("2) Rotation Builder — First Lineup & Game Mode")
+from draft_assistant.core import sleeper
+from draft_assistant.core.evaluation import evaluate_players, SCORING_DEFAULT
+from draft_assistant.core.suggestions import suggest
+from draft_assistant.core.utils import (
+    norm_name,
+    read_player_table,
+    snake_position,
+    starters_from_roster_positions,
+    user_roster_id,
+    slot_to_display_name,
+)
 
-# ---- segmented_control fallback (older Streamlit) ----
-_HAS_SEG = hasattr(st, "segmented_control")
-def seg(label: str, options: List[str], *, key=None, default=None, help=None, horizontal=True):
-    if _HAS_SEG:
-        return st.segmented_control(label, options, default=default, key=key, help=help)
-    idx = options.index(default) if default in options else 0
-    return st.radio(label, options, index=idx, key=key, help=help, horizontal=horizontal)
+st.set_page_config(page_title="FF Draft Assistant — Dynamic Strategy (VBD)", layout="wide")
 
-if "roster" not in st.session_state:
-    st.warning("Please import a roster on the **1_Roster** page first.")
-    st.stop()
+DEFAULT_CSV_PATH = os.environ.get("FFDA_CSV_PATH", "")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# ---------- Helpers ----------
-def _players_present(df: pd.DataFrame) -> List[Player]:
-    return [Player(**row) for _, row in df.iterrows() if int(row.get("IsPresent", 1)) == 1]
+# Behavior toggles / caps
+QB_ROSTER_CAP = int(os.environ.get("FFDA_QB_CAP", "2"))
+INCLUDE_K_DEF_EARLY = bool(int(os.environ.get("FFDA_INCLUDE_K_DEF_EARLY", "0")))  # 0 = late only unless big value
 
-def _eligible_candidates(df: pd.DataFrame, pos: str, side: str) -> List[str]:
-    cands: List[str] = []
-    for _, row in df.iterrows():
-        if int(row.get("IsPresent", 1)) != 1:
-            continue
-        p = Player(**row)
-        if preference_rank(p, pos, side) is not None:
-            cands.append((p.Name or "").strip())
-    return cands
+# =========================
+# Cache
+# =========================
 
-def _build_config() -> Config:
-    ss = st.session_state
-    return Config(
-        fairness=ss["fairness_slider"],
-        formation=(ss["def_formation"] if ss["mode_side"] == "Defense" else None),
-        num_rotations=1,
-        max_consecutive=int(ss.get("max_consecutive", 0)),
-    )
+@st.cache_resource(show_spinner=False)
+def sleeper_players_cache():
+    try:
+        return sleeper.get_players_nfl()
+    except Exception:
+        return {}
 
-def _filter_positions_map(d: Dict[str, str], positions: List[str]) -> Dict[str, str]:
-    """Keep only keys for current positions; normalize empty to ''."""
-    allowed = set(positions)
-    return {pos: (d.get(pos) or "") for pos in positions if pos in allowed}
+@st.cache_data(show_spinner=False)
+def load_local_csv(path: str):
+    return read_player_table(path)
 
-# ---------- Session state ----------
-ss = st.session_state
-ss.setdefault("mode_side", "Offense")
-ss.setdefault("def_formation", "5-3")
-ss.setdefault("fairness_slider", "Balanced")   # Fairness-first | Balanced | Win-push
-ss.setdefault("num_rotations_target", 4)
-ss.setdefault("max_consecutive", 0)
-ss.setdefault("first_lineup_locked", False)
-ss.setdefault("appearances_all", {})           # Name -> count
-ss.setdefault("consecutive_counts", {})        # Name -> consecutive series
-ss.setdefault("series_history", [])            # [{turn, lineup}]
-ss.setdefault("current_turn", 1)
-ss.setdefault("pins", {})                      # pos -> Name (one-shot)
-ss.setdefault("excludes", {})                  # Name -> bool (one-shot)
-ss.setdefault("current_effective", {})         # pos -> Name
-ss.setdefault("next_effective", {})            # pos -> Name
-ss.setdefault("first_series_plan", {})         # pos -> Name
-ss.setdefault("last_sig", None)                # (mode_side, def_formation)
+# =========================
+# Sidebar
+# =========================
 
-# ---------- Sidebar controls ----------
-with st.sidebar:
-    st.header("Rotation Settings")
-    ss["mode_side"] = st.radio("Segment", ["Offense", "Defense"], horizontal=True)
-    if ss["mode_side"] == "Defense":
-        ss["def_formation"] = seg("Defense Formation", ["5-3", "4-4"], default=ss["def_formation"])
-    ss["fairness_slider"] = st.select_slider(
-        "Fairness vs Strength",
-        options=["Fairness-first", "Balanced", "Win-push"],
-        value=ss["fairness_slider"],
-    )
-    ss["num_rotations_target"] = st.number_input("Target rotations (game plan)", 1, 12, ss["num_rotations_target"])
-    ss["max_consecutive"] = st.number_input("Max consecutive series (0=off)", 0, 5, ss["max_consecutive"])
-    st.divider()
-    st.caption("Pins & excludes affect the **next** build only.")
-    # Pins / excludes pickers
-    pos_list_for_picker = positions_for("offense" if ss["mode_side"] == "Offense" else "defense", ss.get("def_formation"))
-    pin_pos = st.selectbox("Pin position", ["(none)"] + pos_list_for_picker, index=0)
-    # normalize names for options
-    roster_df: pd.DataFrame = ss.roster.copy()
-    if "Name" in roster_df.columns:
-        roster_df["Name"] = roster_df["Name"].astype(str).str.strip()
-    all_names = [r["Name"] for _, r in roster_df.iterrows() if int(r.get("IsPresent", 1)) == 1]
-    pin_name = st.selectbox("Pin player (eligible preferred)", ["(none)"] + all_names, index=0)
-    c1, c2 = st.columns(2)
-    if c1.button("Set Pin"):
-        if pin_pos != "(none)" and pin_name != "(none)":
-            ss["pins"][pin_pos] = pin_name
-            st.success(f"Pinned {pin_name} at {pin_pos} for next build.")
-    if c2.button("Clear Pins"):
-        ss["pins"].clear()
-    st.divider()
-    exc_name = st.selectbox("Exclude player (next build only)", ["(none)"] + all_names, index=0)
-    e1, e2 = st.columns(2)
-    if e1.button("Add Exclude"):
-        if exc_name != "(none)":
-            ss["excludes"][exc_name] = True
-            st.info(f"Excluded {exc_name} for next build.")
-    if e2.button("Clear Excludes"):
-        ss["excludes"].clear()
-
-# ---------- Normalize roster names (whitespace) ----------
-roster_df: pd.DataFrame = ss.roster.copy()
-if "Name" in roster_df.columns:
-    roster_df["Name"] = roster_df["Name"].astype(str).str.strip()
-
-players_present = _players_present(roster_df)
-if not players_present:
-    st.warning("No present players (IsPresent=1). Toggle attendance on the Roster page.")
-    st.stop()
-
-# ---------- Detect segment/formation change & sanitize lineups ----------
-side = "offense" if ss["mode_side"] == "Offense" else "defense"
-positions = positions_for(side, ss.get("def_formation"))
-sig_now = (ss["mode_side"], ss.get("def_formation"))
-if ss["last_sig"] != sig_now:
-    ss["last_sig"] = sig_now
-    ss["first_series_plan"] = _filter_positions_map(ss.get("first_series_plan", {}), positions)
-    ss["current_effective"] = _filter_positions_map(ss.get("current_effective", {}), positions)
-    ss["next_effective"] = _filter_positions_map(ss.get("next_effective", {}), positions)
-
-# ---------- Step 1 — Quick rating ----------
-st.subheader("Step 1 — Quick rating (Role & Energy)")
-role_opts = ["Explorer", "Connector", "Driver"]
-energy_opts = ["Low", "Medium", "High"]
-
-hdr1, hdr2, hdr3 = st.columns(3)
-with hdr1: st.caption("Player")
-with hdr2: st.caption("Role Today")
-with hdr3: st.caption("Energy Today")
-
-for p in players_present:
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.write(p.Name)
-    with c2:
-        val = seg(" ", role_opts, key=f"role_{p.Name}", default=p.RoleToday or "Connector")
-        roster_df.loc[roster_df["Name"] == p.Name, "RoleToday"] = val
-    with c3:
-        ev = seg("  ", energy_opts, key=f"energy_{p.Name}", default=p.EnergyToday or "Medium")
-        roster_df.loc[roster_df["Name"] == p.Name, "EnergyToday"] = ev
-
-st.divider()
-
-# ---------- Step 2 — Build 1st Lineup ----------
-st.subheader("Step 2 — Build 1st Lineup")
-cfg = _build_config()
-
-if not ss["first_series_plan"]:
-    assignment, _ = assign_one_rotation(
-        roster_df, side, ss.get("def_formation"), cfg,
-        appearances=ss["appearances_all"], quotas=None,
-        consecutive=ss["consecutive_counts"], pins=ss["pins"], excludes=ss["excludes"]
-    )
-    ss["first_series_plan"] = _filter_positions_map(assignment, positions)
-
-# Editable table
-edits: Dict[str, Optional[str]] = {}
-hc1, hc2, hc3 = st.columns(3)
-with hc1: st.caption("Position")
-with hc2: st.caption("Player")
-with hc3: st.caption("Category")
-
-for pos in positions:
-    options = _eligible_candidates(roster_df, pos, side)
-    current = (ss["first_series_plan"].get(pos) or "").strip()
-    if current and current not in options:
-        current = ""
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.write(pos)
-    with c2:
-        pick = st.selectbox(
-            f"{pos} pick",
-            options=["(empty)"] + options,
-            index=(["(empty)"] + options).index(current) if current in options else 0,
-            key=f"pick_{pos}",
-        )
-        edits[pos] = None if pick == "(empty)" else pick
-    with c3:
-        st.write(CATEGORY_MAP.get(pos, "GEN"))
-
-for pos, pick in edits.items():
-    ss["first_series_plan"][pos] = (pick or "").strip()
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    if st.button("Auto-Fill Best (respect eligibility & fairness bias)"):
-        assignment, _ = assign_one_rotation(
-            roster_df, side, ss.get("def_formation"), cfg,
-            appearances=ss["appearances_all"], quotas=None,
-            consecutive=ss["consecutive_counts"], pins=ss["pins"], excludes=ss["excludes"]
-        )
-        ss["first_series_plan"] = _filter_positions_map(assignment, positions)
-        st.success("Auto-filled best 1st lineup.")
-with c2:
-    if not ss["first_lineup_locked"] and st.button("Lock 1st Lineup"):
-        # ✅ Duplicate check ONLY across CURRENT positions
-        used: set[str] = set()
-        dupes: set[str] = set()
-        for pos in positions:
-            name = (ss["first_series_plan"].get(pos) or "").strip()
-            if not name:
-                continue
-            if name in used:
-                dupes.add(name)
-            used.add(name)
-        if dupes:
-            st.error(f"Duplicate player(s) in lineup: {', '.join(sorted(dupes))}")
-        else:
-            ss["current_effective"] = _filter_positions_map(ss["first_series_plan"], positions)
-            ss["first_lineup_locked"] = True
-            st.success("1st lineup locked. Ready for Game.")
-with c3:
-    if st.button("Clear 1st Lineup"):
-        ss["first_series_plan"] = {}
-
-st.divider()
-
-# ---------- Step 3 — Game Mode ----------
-st.subheader("Step 3 — Game Mode")
-if not ss["first_lineup_locked"]:
-    st.info("Lock the 1st lineup to start the game loop.")
-    st.stop()
-
-def _commit_series(lineup: Dict[str, str]):
-    used = set()
-    for pos in positions:
-        name = (lineup.get(pos) or "").strip()
-        if not name:
-            continue
-        ss["appearances_all"][name] = ss["appearances_all"].get(name, 0) + 1
-        used.add(name)
-    all_names = [p.Name for p in _players_present(roster_df)]
-    for nm in all_names:
-        if nm in used:
-            ss["consecutive_counts"][nm] = ss["consecutive_counts"].get(nm, 0) + 1
-        else:
-            ss["consecutive_counts"][nm] = 0
-
-def _build_next_series():
-    nxt, _ = assign_one_rotation(
-        roster_df, side, ss.get("def_formation"), cfg,
-        appearances=ss["appearances_all"], quotas=None,
-        consecutive=ss["consecutive_counts"], pins=ss["pins"], excludes=ss["excludes"]
-    )
-    ss["next_effective"] = _filter_positions_map(nxt, positions)
-
-prev_lineup = ss["series_history"][-1]["lineup"] if ss["series_history"] else {}
-cA, cB, cC = st.columns(3)
-
-with cA:
-    st.caption("Previous")
-    if prev_lineup:
-        for pos in positions:
-            st.write(f"**{pos}** — {prev_lineup.get(pos,'') or '—'}")
+def sidebar_controls():
+    st.sidebar.header("Data")
+    src = st.sidebar.radio("Player data source", ["Upload", "Local path"])
+    csv_df = None
+    if src == "Upload":
+        up = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+        if up is not None:
+            csv_df = read_player_table(up)
     else:
-        st.write("—")
+        path = st.sidebar.text_input("CSV/Excel path", value=DEFAULT_CSV_PATH)
+        if st.sidebar.button("Load path") and path:
+            csv_df = load_local_csv(path)
 
-with cB:
-    st.caption(f"Current — Series {ss['current_turn']}")
-    cur_edits: Dict[str, Optional[str]] = {}
-    for pos in positions:
-        opts = _eligible_candidates(roster_df, pos, side)
-        cur_val = (ss["current_effective"].get(pos) or "").strip()
-        if cur_val and cur_val not in opts:
-            cur_val = ""
-        pick = st.selectbox(
-            f"Cur {pos}", ["(empty)"] + opts,
-            index=(["(empty)"] + opts).index(cur_val) if cur_val in opts else 0,
-            key=f"cur_{pos}",
+    st.sidebar.header("Weights")
+    inj_w = st.sidebar.slider("Injury penalty weight", 0.0, 1.0, 0.5, 0.05)
+    sos_w = st.sidebar.slider("Schedule strength weight", 0.0, 0.3, 0.05, 0.01)
+    usage_w = st.sidebar.slider("Usage/Upside weight", 0.0, 0.5, 0.05, 0.01)
+    weights = {"inj_w": inj_w, "sos_w": sos_w, "usage_w": usage_w}
+
+    st.sidebar.header("Sleeper (Live)")
+    league_id = st.sidebar.text_input("League ID", value="")
+    username = st.sidebar.text_input("Your Sleeper username (optional)", value="Fallon3D")
+    seat = st.sidebar.number_input("Your draft slot (1–Teams; 0=auto)", min_value=0, max_value=20, value=0)
+
+    poll_secs = st.sidebar.slider("Auto-refresh seconds", 3, 30, 5, 1)
+    auto_live = st.sidebar.toggle("Auto-refresh (Live tab)", value=False)
+
+    st.sidebar.header("K/DEF")
+    include_k_def_anytime = st.sidebar.checkbox(
+        "Allow K & DEF to appear anytime if value is high",
+        value=INCLUDE_K_DEF_EARLY
+    )
+
+    if st.sidebar.button("Reset dynamic memory"):
+        for k in ["prev_strategy"]:
+            st.session_state.pop(k, None)
+        st.sidebar.success("Strategy will be re-evaluated fresh on your next pick.")
+
+    return csv_df, weights, league_id, username, int(seat), poll_secs, auto_live, include_k_def_anytime
+
+# =========================
+# Helpers: positions, windows, demand, reasons
+# =========================
+
+def compute_next_pick_window(teams: int, seat: int, current_overall_pick: int) -> int:
+    if not (1 <= seat <= teams):
+        return teams
+    rnd = (current_overall_pick - 1) // teams + 1
+    pos = (current_overall_pick - 1) % teams + 1
+    my_pos_this = seat if rnd % 2 == 1 else (teams - seat + 1)
+    if my_pos_this >= pos:
+        return my_pos_this - pos
+    my_pos_next = (teams - seat + 1) if rnd % 2 == 1 else seat
+    return (teams - pos) + my_pos_next
+
+def _pos_from_meta(p: dict) -> str:
+    return str((p.get("metadata") or {}).get("position") or "").upper().replace("DST","DEF")
+
+def _team_pos_counts_from_picks(picks: List[dict], teams: int) -> Dict[int, Dict[str,int]]:
+    counts = {slot: {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0} for slot in range(1, teams+1)}
+    for p in picks or []:
+        try:
+            slot = int(p.get("slot") or p.get("roster_id") or 0)
+        except Exception:
+            slot = 0
+        if not (1 <= slot <= teams):
+            continue
+        pos = _pos_from_meta(p)
+        if pos in counts[slot]:
+            counts[slot][pos] += 1
+    return counts
+
+def _slots_between(current_overall: int, my_next_overall: int, teams: int) -> List[int]:
+    slots = []
+    pick = current_overall
+    while pick < my_next_overall:
+        _, _, slot = snake_position(pick, teams)
+        if slot not in slots:
+            slots.append(slot)
+        pick += 1
+    return slots
+
+def _needs_by_slot(team_counts: Dict[int,Dict[str,int]], starters: Dict[str,int]) -> Dict[int,Dict[str,int]]:
+    needs = {}
+    for slot, cmap in team_counts.items():
+        needs[slot] = {k: 0 for k in ["QB","RB","WR","TE","K","DEF"]}
+        for pos in ["QB","RB","WR","TE","K","DEF"]:
+            base = starters.get(pos, 0)
+            if pos in ("QB","TE","K","DEF"):
+                base = max(1, base)
+            needs[slot][pos] = max(0, base - cmap.get(pos, 0))
+    return needs
+
+def _english_injury(x) -> str:
+    if pd.isna(x): return "low"
+    try:
+        x = float(x)
+    except Exception:
+        s = str(x).strip().lower()
+        if s in ("low","l"): return "low"
+        if s in ("med","moderate","m"): return "moderate"
+        if s in ("high","h"): return "high"
+        return "low"
+    if x <= 0.07: return "low"
+    if x <= 0.14: return "moderate"
+    return "high"
+
+def _make_it_back_probability(row: pd.Series, picks_until_next: int, demand_ratio: float, current_overall: int) -> float:
+    scale = 6.0
+    adp = row.get("ADP")
+    if pd.isna(adp) or adp <= 0:
+        adp = current_overall + 12.0
+    adp_gap = float(adp) - float(current_overall)
+    x = (picks_until_next - adp_gap) / scale
+    demand_multiplier = min(1.4, max(0.7, 0.7 + demand_ratio * 0.7))
+    p_taken = 1.0 / (1.0 + math.exp(-x))
+    p_taken *= demand_multiplier
+    p_taken = max(0.0, min(1.0, p_taken))
+    return float(max(0.0, min(1.0, 1.0 - p_taken)))
+
+def _reason_plain_english(row: pd.Series, need_for_pos: int, prob_back: float, next_picks: int) -> str:
+    bits = []
+    bits.append(f"Strong {row['POS']} value (VBD {row.get('VBD',0):.1f}).")
+    if not pd.isna(row.get("TIER")):
+        bits.append(f"Tier {int(row['TIER'])}.")
+    if need_for_pos > 0:
+        bits.append(f"You still need {need_for_pos} at {row['POS']}.")
+    risk_txt = "likely" if prob_back >= 0.65 else ("50/50" if prob_back >= 0.35 else "unlikely")
+    bits.append(f"{risk_txt} to make it {next_picks} picks back ({prob_back*100:.0f}%).")
+    inj = _english_injury(row.get("INJURY_RISK"))
+    if inj != "low":
+        bits.append(f"Injury risk {inj}.")
+    if not pd.isna(row.get("BYE")) and int(row.get("BYE") or 0) > 0:
+        bits.append(f"Bye {int(row['BYE'])}.")
+    return " ".join(bits)
+
+# =========================
+# Runs, tier cliffs, K/DEF visibility, QB cap
+# =========================
+
+def _recent_runs(picks: List[dict], window: int = 8) -> Dict[str,int]:
+    tail = (picks or [])[-window:]
+    counts = {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0}
+    for p in tail:
+        pos = _pos_from_meta(p)
+        if pos in counts:
+            counts[pos] += 1
+    return counts
+
+def _tier_depth(avail_df: pd.DataFrame, pos: str) -> Tuple[int, float]:
+    pool = avail_df[avail_df["POS"] == pos]
+    if pool.empty:
+        return 0, 0.0
+    top = pool.sort_values(["VBD","EVAL_PTS"], ascending=False)
+    t = top.iloc[0].get("TIER")
+    if pd.isna(t):
+        return min(9, len(top)), float(top.iloc[0].get("VBD", 0.0))
+    depth = int(pool[pool["TIER"] == t].shape[0])
+    edge = float(top.iloc[0].get("VBD", 0.0))
+    return depth, edge
+
+def _ensure_k_def_in_suggestions(sugg_df: pd.DataFrame, avail_df: pd.DataFrame, rnd: int, total_rounds: int, include_anytime: bool) -> pd.DataFrame:
+    if sugg_df is None or sugg_df.empty: return sugg_df
+    want_force = (rnd >= total_rounds-1)
+    have_k = (sugg_df["POS"]=="K").any()
+    have_d = (sugg_df["POS"]=="DEF").any()
+    if have_k and have_d:
+        return sugg_df
+    top_k = avail_df[avail_df["POS"]=="K"].sort_values(["VBD","EVAL_PTS"], ascending=False).head(1)
+    top_d = avail_df[avail_df["POS"]=="DEF"].sort_values(["VBD","EVAL_PTS"], ascending=False).head(1)
+    base = sugg_df.copy()
+    tail_vbd = float(base["VBD"].iloc[min(len(base)-1, 7)]) if "VBD" in base.columns and not base.empty else 0.0
+    candidates = []
+    if not top_k.empty and (want_force or (include_anytime and float(top_k.iloc[0]["VBD"]) >= tail_vbd - 15)):
+        candidates.append(top_k.iloc[0])
+    if not top_d.empty and (want_force or (include_anytime and float(top_d.iloc[0]["VBD"]) >= tail_vbd - 15)):
+        candidates.append(top_d.iloc[0])
+    if candidates:
+        base = pd.concat([base, pd.DataFrame(candidates)], ignore_index=True)
+        base = base.drop_duplicates(subset=["PLAYER"], keep="first").sort_values(["VBD","EVAL_PTS"], ascending=False).head(8).reset_index(drop=True)
+    return base
+
+def _apply_qb_cap(sugg_df: pd.DataFrame, qbs_owned: int, cap: int) -> pd.DataFrame:
+    if sugg_df is None or sugg_df.empty: return sugg_df
+    remaining = max(0, cap - max(0, qbs_owned))
+    qbs = sugg_df[sugg_df["POS"]=="QB"]
+    non = sugg_df[sugg_df["POS"]!="QB"]
+    if remaining <= 0:
+        return non.head(len(sugg_df)).reset_index(drop=True)
+    return pd.concat([non, qbs.head(remaining)], ignore_index=True).head(len(sugg_df)).reset_index(drop=True)
+
+# =========================
+# Dynamic multi-strategy chooser
+# =========================
+
+STRATS = [
+    "Zero RB", "Modified Zero RB", "Hero RB", "Robust RB",
+    "Hyper-Fragile RB", "WR-Heavy", "Pocket QB", "Bimodal RB", "Balanced"
+]
+STRAT_TARGETS = {
+    "Zero RB":        {"RB":5, "WR":7, "TE":1, "QB":1},
+    "Modified Zero RB":{"RB":4, "WR":7, "TE":1, "QB":1},
+    "Hero RB":        {"RB":5, "WR":6, "TE":1, "QB":1},
+    "Robust RB":      {"RB":6, "WR":5, "TE":1, "QB":1},
+    "Hyper-Fragile RB":{"RB":4, "WR":7, "TE":1, "QB":1},
+    "WR-Heavy":       {"RB":4, "WR":8, "TE":1, "QB":1},
+    "Pocket QB":      {"RB":5, "WR":6, "TE":1, "QB":1},
+    "Bimodal RB":     {"RB":5, "WR":6, "TE":1, "QB":1},
+    "Balanced":       {"RB":5, "WR":6, "TE":1, "QB":1},
+}
+
+def score_strategies(
+    avail_df: pd.DataFrame,
+    my_counts: Dict[str,int],
+    starters: Dict[str,int],
+    rnd: int,
+    teams: int,
+    seat: int,
+    picks_until_next: int,
+    recent_run_counts: Dict[str,int],
+) -> List[Dict[str,object]]:
+    """
+    Heuristic scoring for each strategy based on board edges, tier depth, runs, seat/turn distance, and current roster.
+    Higher score = better fit right now.
+    """
+    if avail_df is None or avail_df.empty:
+        return [{"name":"Balanced","score":0.0,"why":"Empty board","plan":{}}]
+
+    # Top VBD and tier depth snapshots
+    depth = {}; edge = {}
+    for p in ["RB","WR","TE","QB"]:
+        d, e = _tier_depth(avail_df, p); depth[p]=d; edge[p]=e
+
+    # Aggregate WR/TE head start for Zero-type approaches
+    wr_edge = edge.get("WR",0.0); te_edge = edge.get("TE",0.0); rb_edge = edge.get("RB",0.0); qb_edge = edge.get("QB",0.0)
+    wr_depth = depth.get("WR",0); te_depth = depth.get("TE",0); rb_depth = depth.get("RB",0)
+
+    # Recent runs pressure
+    run_boost_wr = recent_run_counts.get("WR",0)
+    run_boost_rb = recent_run_counts.get("RB",0)
+    run_boost_qb = recent_run_counts.get("QB",0)
+
+    # Seat dynamics
+    early_turn = seat in (1, teams)
+    long_wrap = picks_until_next >= teams // 2
+
+    results = []
+
+    # Helper to formulate simple plan
+    def make_plan(strategy: str) -> Dict[int,str]:
+        plan = {}
+        for i in range(rnd, rnd+6):
+            if strategy == "Zero RB":
+                plan[i] = "WR/TE" if i <= rnd+3 else ("RB upside" if i <= rnd+5 else "QB/K/DEF")
+            elif strategy == "Modified Zero RB":
+                plan[i] = "WR/TE" if i <= rnd+2 else ("RB upside" if i <= rnd+5 else "QB/K/DEF")
+            elif strategy == "Hero RB":
+                plan[i] = "RB" if i == rnd and my_counts.get("RB",0) < 1 else ("WR/TE" if i <= rnd+3 else "QB/K/DEF")
+            elif strategy == "Robust RB":
+                plan[i] = "RB" if i in (rnd, rnd+1) and my_counts.get("RB",0) < 2 else ("WR/TE" if i <= rnd+4 else "QB/K/DEF")
+            elif strategy == "Hyper-Fragile RB":
+                if my_counts.get("RB",0) < 2 and i <= rnd+2: plan[i]="RB"
+                elif my_counts.get("RB",0) == 2 and i <= rnd+4: plan[i]="WR/TE"
+                else: plan[i]="WR/TE"
+            elif strategy == "WR-Heavy":
+                plan[i] = "WR" if i <= rnd+2 else ("TE/RB" if i <= rnd+4 else "QB/K/DEF")
+            elif strategy == "Pocket QB":
+                plan[i] = "WR/TE/RB" if i <= rnd+6 else "QB"
+            elif strategy == "Bimodal RB":
+                plan[i] = "WR/TE" if i <= rnd+2 else ("RB" if i in (rnd+3, rnd+4) else "WR/TE")
+            else:
+                plan[i] = "Best Value (RB/WR/TE)" if i <= rnd+3 else "QB/K/DEF"
+        return plan
+
+    # Compute per-strategy score & why
+    for name in STRATS:
+        score = 0.0
+        why_bits = []
+
+        if name == "Zero RB":
+            # Big pass-catcher edge early
+            score += max(0.0, (max(wr_edge, te_edge) - rb_edge)) * 0.9
+            score += (wr_depth + te_depth) * 0.6
+            if rnd <= 3: score += 10
+            if run_boost_wr >= 3: score -= 6  # WR run reduces comfort
+            if my_counts.get("RB",0) >= 1: score -= 5
+            why_bits.append("Pass-catchers show early VBD edge; delay RB.")
+
+        elif name == "Modified Zero RB":
+            score += max(0.0, (max(wr_edge, te_edge) - rb_edge)) * 0.7
+            score += (wr_depth + te_depth) * 0.5
+            # look for a mid-round RB pocket: many RB left in next tier
+            score += max(0, rb_depth - 3) * 0.8
+            if rnd <= 3: score += 7
+            if my_counts.get("RB",0) == 0 and long_wrap: score += 4
+            why_bits.append("Pass-catchers now; mid-round RB pocket later.")
+
+        elif name == "Hero RB":
+            # One RB with clear edge
+            score += max(0.0, (rb_edge - max(wr_edge, te_edge))) * 1.1
+            if my_counts.get("RB",0) == 0 and rnd <= 2: score += 10
+            if run_boost_rb >= 2: score -= 4  # don't chase
+            why_bits.append("One elite RB projects a large VBD lead.")
+
+        elif name == "Robust RB":
+            # Two+ RBs look strong & you are on/near turn
+            score += max(0.0, (rb_edge - max(wr_edge, te_edge))) * 0.9
+            if early_turn or long_wrap: score += 6
+            if my_counts.get("RB",0) <= 1 and rnd <= 3: score += 7
+            if run_boost_rb >= 3: score -= 6
+            why_bits.append("Multiple bell-cow RBs at good prices.")
+
+        elif name == "Hyper-Fragile RB":
+            # You already have 2 RBs early; stop at 2–3
+            if my_counts.get("RB",0) >= 2 and rnd <= 6: score += 12
+            if my_counts.get("RB",0) == 3: score += 6
+            if rb_edge <= max(wr_edge, te_edge): score += 5
+            why_bits.append("After 2–3 RBs, shift to WR/TE for depth.")
+
+        elif name == "WR-Heavy":
+            score += max(0.0, (wr_edge - max(rb_edge, te_edge))) * 1.0
+            score += wr_depth * 0.7
+            if rnd <= 3: score += 8
+            if run_boost_wr >= 3: score -= 6
+            why_bits.append("WR tiers deeper and stronger than RB.")
+
+        elif name == "Pocket QB":
+            # Suppress early QB unless it clearly leads
+            if rnd <= 5 and qb_edge < max(wr_edge, rb_edge, te_edge) + 5:
+                score += 10  # keep passing QB
+            # bump if qb pocket approaches (qb edge within 5 of others and many teams need QB soon)
+            score += max(0.0, qb_edge - (max(wr_edge, rb_edge, te_edge) - 5)) * 0.4
+            why_bits.append("Pass QB until the pocket beats other positions.")
+
+        elif name == "Bimodal RB":
+            # prefer two mid RBs together when depth is healthy
+            score += max(0, rb_depth - 4) * 1.0
+            if rnd in (4,5,6): score += 6
+            why_bits.append("Two mid-round RBs can outscore early+late combo.")
+
+        else:  # Balanced (fallback only when very close)
+            score += (wr_edge + rb_edge + te_edge) * 0.2
+            why_bits.append("Board fairly even; take best value with needs.")
+
+        # Gentle penalty to "Balanced" unless it truly wins
+        if name == "Balanced":
+            score -= 6.0
+
+        results.append({"name": name, "score": float(score), "why": "; ".join(why_bits), "plan": make_plan(name)})
+
+    # Sort by score, prefer non-Balanced on ties
+    results.sort(key=lambda x: (x["score"], x["name"] == "Balanced"), reverse=True)
+    return results
+
+def render_strategy_panel(current: Dict[str,object], targets: Dict[str,int]):
+    with st.container(border=True):
+        st.markdown(f"**Current Strategy (dynamic):** {current['name']}")
+        st.caption(current["why"])
+        plan = current.get("plan") or {}
+        if plan:
+            dfp = pd.DataFrame([{"Round": r, "Ideal pick": plan[r]} for r in sorted(plan.keys())])
+            st.table(dfp)
+        if targets:
+            st.caption(f"Roster targets — RB {targets.get('RB','?')}, WR {targets.get('WR','?')}, TE {targets.get('TE','?')}, QB {targets.get('QB','?')}.")
+
+# =========================
+# Live tab
+# =========================
+
+def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, auto_live, include_k_def_anytime):
+    st.subheader("Live Draft (Sleeper)")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("🔄 Pull latest from Sleeper (Live)"):
+            st.rerun()
+    with c2:
+        if auto_live:
+            st.markdown(f"<meta http-equiv='refresh' content='{int(poll_secs)}'>", unsafe_allow_html=True)
+            st.caption(f"Auto-refresh every {poll_secs}s.")
+
+    if not league_id:
+        st.info("Enter your Sleeper League ID in the sidebar.")
+        return
+
+    # League + draft metadata
+    try:
+        league = sleeper.get_league_info(league_id)
+        users = sleeper.get_users(league_id) or []
+        rosters = sleeper.get_rosters(league_id) or []
+        drafts = sleeper.get_drafts_for_league(league_id) or []
+    except Exception as e:
+        st.error(f"Failed to load league/draft metadata: {e}")
+        return
+
+    teams = int(league.get("total_rosters", 12) or 12)
+    roster_positions = league.get("roster_positions") or ["QB","RB","RB","WR","WR","TE","FLEX","K","DEF"]
+    starters = starters_from_roster_positions(roster_positions)
+    rounds_total = int(league.get("settings", {}).get("rounds", 15) or 15)
+
+    draft_id = ""
+    for d in drafts:
+        if (d.get("status") or "") in ("pre_draft", "in_progress"):
+            draft_id = d.get("draft_id", "")
+            break
+    if not draft_id and drafts:
+        draft_id = drafts[0].get("draft_id", "")
+
+    if not draft_id:
+        st.warning("No draft found for this league yet.")
+        return
+
+    league_name = league.get("name") or league_id
+    st.write(f"**League:** {league_name}  |  **Draft ID:** `{draft_id}`")
+
+    # Picks + players
+    try:
+        picks = sleeper.get_picks(draft_id) or []
+        players_map = sleeper_players_cache()
+    except Exception as e:
+        st.error(f"Failed to load picks/players: {e}")
+        return
+
+    total_picks = len(picks)
+    next_overall = total_picks + 1
+    rnd, pick_in_rnd, slot_on_clock = snake_position(next_overall, teams)
+    team_display = slot_to_display_name(slot_on_clock, users, rosters)
+
+    # Your slot
+    auto_slot = user_roster_id(users, rosters, username) or 0
+    my_slot = int(seat_override) if int(seat_override) > 0 else (auto_slot or 1)
+    you_on_clock = (slot_on_clock == my_slot)
+
+    st.markdown(
+        f"**Current Pick:** Round {rnd}, Pick {pick_in_rnd} — **{team_display}** on the clock."
+        + (" 🎯 _(That’s you)_" if you_on_clock else "")
+    )
+
+    if csv_df is None or csv_df.empty:
+        st.warning("Upload/load your player file in the sidebar.")
+        return
+
+    # Board & availability
+    picked_names = sleeper.picked_player_names(picks, players_map)
+    taken_keys = [norm_name(n) for n in picked_names]
+    picks_until_next = compute_next_pick_window(teams, my_slot, next_overall)
+    avail_df, _ = evaluate_players(
+        csv_df, SCORING_DEFAULT, teams, roster_positions, weights,
+        current_picks=taken_keys, next_pick_window=picks_until_next
+    )
+
+    # Demand & runs
+    team_counts = _team_pos_counts_from_picks(picks, teams)
+    my_counts = team_counts.get(my_slot, {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0})
+    my_next_overall = next_overall + picks_until_next
+    between_slots = _slots_between(next_overall, my_next_overall, teams)
+    needs = _needs_by_slot(team_counts, starters)
+    demand_ratio = {
+        p: (sum(1 for s in between_slots if needs.get(s, {}).get(p, 0) > 0) / max(1, len(between_slots)))
+        for p in ["QB","RB","WR","TE","K","DEF"]
+    }
+    runs = _recent_runs(picks, window=8)
+
+    # -------- Dynamic multi-strategy selection --------
+    strat_ranked = score_strategies(avail_df, my_counts, starters, rnd, teams, my_slot, picks_until_next, runs)
+    current = strat_ranked[0]
+    targets = STRAT_TARGETS.get(current["name"], STRAT_TARGETS["Balanced"])
+
+    # Pivot message if strategy changed from prior pick
+    prev = st.session_state.get("prev_strategy")
+    if prev and prev != current["name"]:
+        st.warning(f"Pivoting strategy: **{prev}** ➜ **{current['name']}** (board shifted).")
+    st.session_state.prev_strategy = current["name"]
+
+    render_strategy_panel(current, targets)
+
+    # Build position needs from targets (how many more to reach the target)
+    base_need = {"QB":0,"RB":0,"WR":0,"TE":0}
+    for pos in base_need:
+        want = max(1, targets.get(pos, 0))
+        base_need[pos] = max(0, want - my_counts.get(pos, 0))
+
+    # Suggestions (VBD-first but guided by needs)
+    sugg = suggest(avail_df, base_need, weights, topk=8)
+
+    # Apply QB cap
+    qb_have = int(my_counts.get("QB", 0))
+    sugg = _apply_qb_cap(sugg, qb_have, QB_ROSTER_CAP)
+
+    # Prefer contingent RBs / spike WRs late (rounds_total-5 onward): already reflected in your CSV if volatility columns exist;
+    # we still sort by VBD/EVAL_PTS which correlates; a deeper bump can be added if you carry explicit upside metrics.
+
+    # Ensure K/DEF appears appropriately
+    sugg = _ensure_k_def_in_suggestions(sugg, avail_df, rnd, rounds_total, include_k_def_anytime)
+
+    # If a run/tier cliff nuked target edges, pivot this pick (don’t chase)
+    # Simple version: if the top suggested pos shows small edge vs alternatives and tier depth <=1, reshuffle by raw VBD
+    if not sugg.empty:
+        top_pos = sugg.iloc[0]["POS"]
+        depth_top, edge_top = _tier_depth(avail_df, top_pos)
+        alt_best = avail_df[avail_df["POS"] != top_pos].sort_values(["VBD","EVAL_PTS"], ascending=False).head(1)
+        if not alt_best.empty:
+            alt_edge = float(alt_best.iloc[0].get("VBD", 0.0))
+            if depth_top <= 1 or (edge_top - alt_edge) <= 5:
+                st.info("Run/tier cliff detected — pivoting to best overall VBD for this pick.")
+                sugg = sugg.sort_values(["VBD","EVAL_PTS"], ascending=False).head(8)
+
+    # Display suggestions w/ make-it-back and reasons
+    disp_rows = []
+    for _, row in sugg.iterrows():
+        pos = row["POS"]
+        need_for_pos = max(0, targets.get(pos, starters.get(pos, 0)) - my_counts.get(pos, 0))
+        prob_back = _make_it_back_probability(
+            row,
+            picks_until_next=picks_until_next,
+            demand_ratio=float(demand_ratio.get(pos, 0.0)),
+            current_overall=next_overall
         )
-        cur_edits[pos] = None if pick == "(empty)" else pick
-    for pos, pick in cur_edits.items():
-        ss["current_effective"][pos] = (pick or "").strip()
+        reason = _reason_plain_english(row, need_for_pos, prob_back, picks_until_next)
+        disp_rows.append({
+            "PLAYER": row["PLAYER"],
+            "POS": pos,
+            "TEAM": row.get("TEAM"),
+            "TIER": row.get("TIER"),
+            "ADP": row.get("ADP"),
+            "EVAL_PTS": f"{row.get('EVAL_PTS',0):.1f}",
+            "VBD": f"{row.get('VBD',0):.1f}",
+            "Make it back": f"{prob_back*100:.0f}%",
+            "Why this pick": reason
+        })
+    disp_df = pd.DataFrame(disp_rows)
 
-with cC:
-    st.caption(f"Next — Series {ss['current_turn']+1}")
-    if not ss["next_effective"]:
-        _build_next_series()
-    for pos in positions:
-        st.write(f"**{pos}** — {ss['next_effective'].get(pos,'') or '—'}")
-
-colg1, colg2, colg3, colg4 = st.columns(4)
-
-with colg1:
-    if st.button("End Series (Commit Current)"):
-        ss["current_effective"] = _filter_positions_map(ss["current_effective"], positions)
-        _commit_series(ss["current_effective"])
-        ss["series_history"].append({"turn": ss["current_turn"], "lineup": ss["current_effective"].copy()})
-        ss["current_turn"] += 1
-        ss["pins"].clear(); ss["excludes"].clear()
-        _build_next_series()
-        ss["current_effective"] = ss["next_effective"].copy()
-        st.success("Series committed.")
-
-with colg2:
-    if st.button("Rebuild Current (respect fairness bias)"):
-        cur, _ = assign_one_rotation(
-            roster_df, side, ss.get("def_formation"), cfg,
-            appearances=ss["appearances_all"], quotas=None,
-            consecutive=ss["consecutive_counts"], pins=ss["pins"], excludes=ss["excludes"]
+    col1, col2 = st.columns([1.25, 1])
+    with col1:
+        st.markdown("### Suggested Picks (Top 8)")
+        if disp_df.empty:
+            st.info("No candidates available.")
+        else:
+            st.dataframe(disp_df, use_container_width=True, height=420)
+    with col2:
+        st.markdown("### Player Board (Available)")
+        show_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","INJURY_RISK","SOS_SEASON"]
+        st.dataframe(
+            avail_df[show_cols].sort_values(["VBD","EVAL_PTS"], ascending=False),
+            use_container_width=True, height=420
         )
-        ss["current_effective"] = _filter_positions_map(cur, positions)
-        st.info("Rebuilt current series.")
 
-with colg3:
-    if st.button("Undo Last Series") and ss["series_history"]:
-        last = ss["series_history"].pop()
-        for pos, name in last["lineup"].items():
-            if name:
-                ss["appearances_all"][name] = max(0, ss["appearances_all"].get(name, 0) - 1)
-        ss["current_turn"] = last["turn"]
-        ss["current_effective"] = _filter_positions_map(last["lineup"], positions)
-        _build_next_series()
-        st.warning("Undid last series.")
+    with st.expander("Debug (Live)"):
+        st.caption(f"Picks fetched: {total_picks}")
+        st.caption(f"My slot (auto/fallback): {my_slot}")
+        st.caption(f"Picks until next: {picks_until_next}; recent runs: {runs}")
+        st.caption(f"Strategy now: {current['name']} (prev: {prev})")
 
-with colg4:
-    pdf_bytes = generate_cards([_filter_positions_map(ss["current_effective"], positions),
-                                _filter_positions_map(ss["next_effective"], positions)])
-    st.download_button("Download Current+Next Cards (PDF)", data=pdf_bytes, file_name="cards.pdf", mime="application/pdf")
+# =========================
+# Mock tab
+# =========================
 
-st.divider()
-st.subheader("Fairness Meter & Who Hasn't Played")
-appear = ss["appearances_all"]
-if appear:
-    vals = list(appear.values())
-    delta = (max(vals) - min(vals)) if vals else 0
-    st.metric("Evenness Δ (≤ 1 ideal)", delta)
-    zeroes = [p.Name for p in _players_present(roster_df) if appear.get(p.Name, 0) == 0]
-    st.write("Haven't played yet:", ", ".join(zeroes) if zeroes else "—")
-else:
-    st.write("No series committed yet.")
+def mock_tab(csv_df, weights, include_k_def_anytime):
+    st.subheader("Mock Draft (Practice)")
+    url_or_id = st.text_input(
+        "Sleeper Mock URL or draft_id",
+        value="",
+        help="Paste a URL like https://sleeper.com/draft/nfl/123... or just the 123... id."
+    )
+    c1, c2, c3 = st.columns([1,1,1])
+    reload_btn = c1.button("Load / Re-sync Mock")
+    clear_btn = c2.button("Reset Practice")
+    force_btn = c3.button("🔄 Pull latest picks (Mock)")
+
+    qb_have_practice = st.number_input("QBs drafted (practice)", min_value=0, max_value=QB_ROSTER_CAP, value=0, step=1)
+
+    if clear_btn:
+        st.session_state.pop("mock_state", None)
+        st.session_state.pop("prev_strategy", None)
+        st.success("Practice state cleared.")
+
+    if csv_df is None or csv_df.empty:
+        st.info("Upload/load your player file in the sidebar.")
+        return
+
+    if reload_btn and url_or_id.strip():
+        draft_id = sleeper.parse_draft_id_from_url(url_or_id.strip())
+        st.caption(f"Parsed draft_id: `{draft_id or 'None'}`")
+        if not draft_id:
+            st.error("Could not parse a draft_id from your input.")
+        else:
+            try:
+                dmeta = sleeper.get_draft(draft_id) or {}
+                teams = int(dmeta.get("settings", {}).get("teams", dmeta.get("teams", 12)) or 12)
+                rounds = int(dmeta.get("settings", {}).get("rounds", 15) or 15)
+                picks = sleeper.get_picks(draft_id) or []
+                players_map = sleeper_players_cache()
+                picked_names = sleeper.picked_player_names(picks, players_map)
+                taken_keys = [norm_name(n) for n in picked_names]
+                roster_positions = ["QB","RB","RB","WR","WR","TE","FLEX","K","DEF"]
+                starters = starters_from_roster_positions(roster_positions)
+                avail_df, _ = evaluate_players(
+                    csv_df, SCORING_DEFAULT, teams, roster_positions, weights, current_picks=taken_keys
+                )
+                st.session_state.mock_state = {
+                    "draft_id": draft_id,
+                    "teams": teams,
+                    "rounds": rounds,
+                    "picks": picks,
+                    "available": avail_df.reset_index(drop=True),
+                    "starters": starters,
+                }
+                st.success(f"Mock {draft_id} loaded — {len(picks)} picks synced, teams={teams}, rounds={rounds}.")
+            except Exception as e:
+                st.error(f"Mock load failed: {e}")
+
+    if "mock_state" not in st.session_state:
+        st.info("Load a mock to begin.")
+        return
+
+    S = st.session_state.mock_state
+    teams = int(S["teams"]); rounds = int(S["rounds"])
+    picks = S["picks"]; starters = S["starters"]
+
+    next_overall = len(picks) + 1
+    rnd, pick_in_rnd, slot_on_clock = snake_position(next_overall, teams)
+    st.write(f"**Current Pick:** Round {rnd}, Pick {pick_in_rnd} — Slot {slot_on_clock}")
+
+    if force_btn:
+        try:
+            new_picks = sleeper.get_picks(S["draft_id"]) or []
+            if len(new_picks) != len(picks):
+                S["picks"] = new_picks
+                picks = new_picks
+                players_map = sleeper_players_cache()
+                picked_names = sleeper.picked_player_names(picks, players_map)
+                taken_keys = [norm_name(n) for n in picked_names]
+                roster_positions = ["QB","RB","RB","WR","WR","TE","FLEX","K","DEF"]
+                avail_df, _ = evaluate_players(
+                    csv_df, SCORING_DEFAULT, teams, roster_positions, weights, current_picks=taken_keys
+                )
+                S["available"] = avail_df.reset_index(drop=True)
+                st.session_state.mock_state = S
+            st.rerun()
+        except Exception as e:
+            st.error(f"Refresh picks failed: {e}")
+
+    # Neutral window ~ teams
+    players_map = sleeper_players_cache()
+    picked_names = sleeper.picked_player_names(picks, players_map)
+    taken_keys = [norm_name(n) for n in picked_names]
+    roster_positions = ["QB","RB","RB","WR","WR","TE","FLEX","K","DEF"]
+    avail_df, _ = evaluate_players(
+        csv_df, SCORING_DEFAULT, teams, roster_positions, weights, current_picks=taken_keys, next_pick_window=teams
+    )
+    S["available"] = avail_df.reset_index(drop=True)
+    st.session_state.mock_state = S
+
+    # Fake “my roster” just for strategy scoring in mocks (use qb_have_practice; others 0)
+    my_counts = {"QB":qb_have_practice,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0}
+    runs = _recent_runs(picks, window=8)
+    strat_ranked = score_strategies(avail_df, my_counts, starters, rnd, teams, slot_on_clock, teams, runs)
+    current = strat_ranked[0]
+    targets = STRAT_TARGETS.get(current["name"], STRAT_TARGETS["Balanced"])
+
+    prev = st.session_state.get("prev_strategy")
+    if prev and prev != current["name"]:
+        st.warning(f"Pivoting strategy: **{prev}** ➜ **{current['name']}** (board shifted).")
+    st.session_state.prev_strategy = current["name"]
+
+    render_strategy_panel(current, targets)
+
+    base_need = {"QB":1,"RB":2,"WR":2,"TE":1}
+    for pos in base_need:
+        base_need[pos] = max(1, targets.get(pos, base_need[pos]))
+
+    sugg = suggest(S["available"], base_need, weights, topk=8)
+    sugg = _apply_qb_cap(sugg, qb_have_practice, QB_ROSTER_CAP)
+    sugg = _ensure_k_def_in_suggestions(sugg, S["available"], rnd, rounds, include_k_def_anytime)
+
+    demand_ratio = {p: 0.5 for p in ["QB","RB","WR","TE","K","DEF"]}
+
+    disp_rows = []
+    for _, row in sugg.iterrows():
+        pos = row["POS"]
+        prob_back = _make_it_back_probability(
+            row, picks_until_next=teams, demand_ratio=demand_ratio.get(pos,0.5), current_overall=next_overall
+        )
+        reason = _reason_plain_english(row, need_for_pos=1 if pos in ("QB","TE","K","DEF") else 2, prob_back=prob_back, next_picks=teams)
+        disp_rows.append({
+            "PLAYER": row["PLAYER"],
+            "POS": pos,
+            "TEAM": row.get("TEAM"),
+            "TIER": row.get("TIER"),
+            "ADP": row.get("ADP"),
+            "EVAL_PTS": f"{row.get('EVAL_PTS',0):.1f}",
+            "VBD": f"{row.get('VBD',0):.1f}",
+            "Make it back": f"{prob_back*100:.0f}%",
+            "Why this pick": reason
+        })
+    disp_df = pd.DataFrame(disp_rows)
+
+    col1, col2 = st.columns([1.25, 1])
+    with col1:
+        st.markdown("### Suggested Picks (Top 8)")
+        if disp_df.empty:
+            st.info("No candidates available.")
+        else:
+            st.dataframe(disp_df, use_container_width=True, height=420)
+    with col2:
+        st.markdown("### Player Board (Available)")
+        show_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","INJURY_RISK","SOS_SEASON"]
+        st.dataframe(S["available"][show_cols].sort_values(["VBD","EVAL_PTS"], ascending=False), use_container_width=True)
+
+# =========================
+# Board tab
+# =========================
+
+def board_tab(csv_df, weights):
+    st.subheader("Player Board & Filters")
+    if csv_df is None or csv_df.empty:
+        st.info("Upload/load your player file in the sidebar.")
+        return
+
+    teams = st.number_input("Teams", 8, 16, 12, 1)
+    roster_positions = st.text_input("Roster positions (comma)", value="QB,RB,RB,WR,WR,TE,FLEX,K,DEF")
+    roster_positions = [p.strip().upper() for p in roster_positions.split(",") if p.strip()]
+
+    avail_df, _ = evaluate_players(
+        csv_df, SCORING_DEFAULT, int(teams), roster_positions, weights, current_picks=[]
+    )
+
+    pos = st.multiselect("Position", ["QB","RB","WR","TE","K","DEF"], default=["RB","WR","TE","QB","K","DEF"])
+    team = st.text_input("Team filter (e.g., KC, SF)")
+    tier_max = st.number_input("Max Tier (optional)", 0, 20, 20, 1)
+
+    filt = avail_df[avail_df["POS"].isin(pos)].copy()
+    if team:
+        filt = filt[filt["TEAM"].fillna("").str.upper().str.contains(team.strip().upper(), na=False)]
+    if tier_max < 20:
+        filt = filt[(filt["TIER"].isna()) | (filt["TIER"] <= tier_max)]
+
+    st.dataframe(filt.sort_values(["VBD","EVAL_PTS"], ascending=False), use_container_width=True)
+    csv = filt.to_csv(index=False).encode()
+    st.download_button("Download filtered board CSV", csv, "filtered_board.csv", "text/csv")
+
+# =========================
+# Main
+# =========================
+
+def main():
+    st.title("Fantasy Football Draft Assistant — Dynamic Strategy, VBD, & Pivots")
+    csv_df, weights, league_id, username, seat, poll_secs, auto_live, include_k_def_anytime = sidebar_controls()
+
+    tabs = st.tabs(["Live Draft", "Mock Draft", "Player Board"])
+    with tabs[0]:
+        live_tab(csv_df, weights, league_id, username, seat, poll_secs, auto_live, include_k_def_anytime)
+    with tabs[1]:
+        mock_tab(csv_df, weights, include_k_def_anytime)
+    with tabs[2]:
+        board_tab(csv_df, weights)
+
+if __name__ == "__main__":
+    main()
