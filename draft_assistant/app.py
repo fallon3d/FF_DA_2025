@@ -4,12 +4,11 @@ import time
 import pandas as pd
 import streamlit as st
 
-# --- ensure repo root is importable when running a file inside the package ---
-# e.g. Streamlit Cloud may run from a different CWD
+# --- ensure repo root is importable when running from package path ---
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------
 
 from draft_assistant.core import sleeper
 from draft_assistant.core.evaluation import evaluate_players, SCORING_DEFAULT
@@ -21,12 +20,13 @@ st.set_page_config(page_title="FF Draft Assistant (VBD)", layout="wide")
 
 DEFAULT_CSV_PATH = os.environ.get("FFDA_CSV_PATH", "")
 
-# ---------- Caching ----------
+# =========================
+# Caching
+# =========================
 
 @st.cache_data(show_spinner=False)
 def load_csv(path_or_buffer):
-    df = pd.read_csv(path_or_buffer)
-    return df
+    return pd.read_csv(path_or_buffer)
 
 @st.cache_resource(show_spinner=False)
 def sleeper_players_cache():
@@ -35,7 +35,9 @@ def sleeper_players_cache():
     except Exception:
         return {}
 
-# ---------- Sidebar ----------
+# =========================
+# Sidebar
+# =========================
 
 def sidebar_controls():
     st.sidebar.header("Data")
@@ -58,50 +60,94 @@ def sidebar_controls():
 
     st.sidebar.header("League")
     league_id = st.sidebar.text_input("Sleeper League ID", value="")
-    poll_secs = st.sidebar.slider("Auto-refresh seconds (manual mode uses this if you enable it)", 2, 30, 5, 1)
-    auto = st.sidebar.toggle("Auto-refresh (simple)", value=False)
+    poll_secs = st.sidebar.slider("Auto-refresh seconds", 2, 30, 5, 1)
+    auto = st.sidebar.toggle("Auto-refresh", value=False)
 
     return csv_df, weights, league_id, poll_secs, auto
 
-# ---------- Helpers ----------
+# =========================
+# Helpers: picks parsing
+# =========================
+
+def normalize_picks(picks):
+    """
+    Sleeper may return:
+      - a list[dict] of picks, or
+      - a dict wrapper containing 'picks'/'draft_picks'
+    Normalize to list[dict].
+    """
+    if isinstance(picks, dict):
+        for key in ("picks", "draft_picks", "data"):
+            val = picks.get(key)
+            if isinstance(val, list):
+                return val
+        return []
+    return picks if isinstance(picks, list) else []
+
 
 def map_taken_from_picks(picks, players_index):
     """
-    Map Sleeper picks to normalized player keys and position history.
+    Convert Sleeper picks into:
+      - taken_keys: normalized player keys for filtering
+      - pos_history: simple list of positions in pick order
+    Tolerant to None/non-dict entries and sparse metadata.
     """
-    taken_keys = []
-    pos_history = []
-    for p in picks or []:
-        pid = str(p.get("player_id", ""))
-        meta = p.get("metadata") or {}
-        pos = meta.get("position") or ""
+    taken_keys, pos_history = [], []
+    for p in normalize_picks(picks):
+        if not isinstance(p, dict):
+            continue
+
+        meta = p.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+
+        # Player id may be on the pick or in metadata
+        pid = str(p.get("player_id") or meta.get("player_id") or "")
+
+        # Try to resolve full name and position
         full_name = None
+        pos = meta.get("position") or meta.get("position_group") or ""
+
         if pid and pid in players_index:
-            info = players_index[pid]
-            full_name = info.get("full_name") or (info.get("first_name", "") + " " + info.get("last_name", "")).strip()
+            info = players_index.get(pid) or {}
+            full_name = (
+                info.get("full_name")
+                or f"{info.get('first_name','')} {info.get('last_name','')}".strip()
+            )
             pos = info.get("position") or pos
-        else:
-            if meta.get("first_name") or meta.get("last_name"):
-                full_name = f"{meta.get('first_name','')} {meta.get('last_name','')}".strip()
+
+        if not full_name:
+            full_name = (
+                meta.get("full_name")
+                or meta.get("player")
+                or f"{meta.get('first_name','')} {meta.get('last_name','')}".strip()
+            ).strip()
+
         if full_name:
             taken_keys.append(norm_name(full_name))
         if pos:
-            pos_history.append(pos.upper().replace("DST", "DEF"))
+            pos_history.append(str(pos).upper().replace("DST", "DEF"))
+
     return taken_keys, pos_history
+
 
 def roster_need_state(my_roster_counts, starters_counts):
     """
-    Simple roster guardrails: aim for starters + 1 depth by mid draft.
+    Soft roster guardrails: aim for starters + 1 depth by mid draft.
     """
     need = {}
     for pos in ["QB", "RB", "WR", "TE"]:
-        have = my_roster_counts.get(pos, 0)
-        want = starters_counts.get(pos, 0)
+        have = int(my_roster_counts.get(pos, 0))
+        want = int(starters_counts.get(pos, 0))
         target = max(want, 1) + 1
         need[pos] = max(0, target - have)
     return need
 
+
 def fetch_live_state(league_id):
+    """
+    Fetch league, roster positions, user map, active draft_id, and picks (normalized).
+    """
     league = sleeper.get_league(league_id)
     teams = int(league.get("total_rosters", 12) or 12)
     roster_positions = league.get("roster_positions") or []
@@ -111,7 +157,6 @@ def fetch_live_state(league_id):
     drafts = sleeper.get_drafts_for_league(league_id)
     draft_id = ""
     for d in drafts:
-        # Prefer active or pre_draft
         status = (d.get("status") or "")
         if status in ("pre_draft", "in_progress"):
             draft_id = d.get("draft_id", "")
@@ -120,9 +165,12 @@ def fetch_live_state(league_id):
         draft_id = drafts[0].get("draft_id", "")
 
     picks = sleeper.get_draft_picks(draft_id) if draft_id else []
+    picks = normalize_picks(picks)
     return league, teams, roster_positions, user_map, draft_id, picks
 
-# ---------- Tabs ----------
+# =========================
+# Tabs
+# =========================
 
 def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
     st.subheader("Live Draft (Sleeper)")
@@ -139,16 +187,15 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
 
     st.caption(f"Detected **{teams} teams**; roster positions: {roster_positions}")
     if not draft_id:
-        st.warning("No draft found for this league. (If your draft hasn't been created yet, check again later.)")
+        st.warning("No draft found for this league. (If the draft isn't created/started yet, check again later.)")
         return
     st.write(f"Draft ID: `{draft_id}`")
 
     # Select your team for roster need tracking
+    my_user_id = None
     if user_map:
         my_display = st.selectbox("Select your user/team (for roster tracking)", list(user_map.keys()))
         my_user_id = user_map.get(my_display)
-    else:
-        my_user_id = None
 
     players_index = sleeper_players_cache()
     taken_keys, pos_history = map_taken_from_picks(picks, players_index)
@@ -156,11 +203,11 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
     # My roster counts from picks already made
     my_roster_counts = {"QB": 0, "RB": 0, "WR": 0, "TE": 0}
     if my_user_id:
-        mine = [p for p in picks if str(p.get("picked_by")) == str(my_user_id)]
+        mine = [p for p in picks if isinstance(p, dict) and str(p.get("picked_by")) == str(my_user_id)]
         my_pos = []
         for p in mine:
-            pid = str(p.get("player_id", ""))
             pos = ""
+            pid = str(p.get("player_id") or (p.get("metadata") or {}).get("player_id") or "")
             if pid and pid in players_index:
                 pos = players_index[pid].get("position", "")
             if pos:
@@ -176,7 +223,6 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
     needs = roster_need_state(my_roster_counts, starters)
     sugg = suggest(avail_df, needs, weights, topk=8)
 
-    # UI
     col1, col2 = st.columns([1, 1])
     with col1:
         st.markdown("### Suggested Picks (Top 8)")
@@ -195,16 +241,16 @@ def live_tab(csv_df, weights, league_id, poll_secs, auto_refresh):
         st.warning(" | ".join(runs))
     st.caption(f"Taken so far: {len(taken_keys)} | Recent positions: {' → '.join(pos_history[-12:])}")
 
-    # Simple manual/auto refresh
+    # Manual/auto refresh
     colr1, colr2 = st.columns([1, 1])
     with colr1:
         if st.button("Refresh now"):
             st.experimental_rerun()
     with colr2:
         if auto_refresh:
-            # very simple auto-refresh approach
             time.sleep(poll_secs)
             st.experimental_rerun()
+
 
 def mock_tab(csv_df, weights):
     st.subheader("Mock Draft (Sleeper URL)")
@@ -212,6 +258,7 @@ def mock_tab(csv_df, weights):
     if not url:
         st.info("Paste a Sleeper mock URL to mirror the room.")
         return
+
     draft_id = sleeper.parse_mock_draft_id_from_url(url)
     if not draft_id:
         st.error("Could not parse draft id from URL.")
@@ -224,10 +271,9 @@ def mock_tab(csv_df, weights):
     except Exception as e:
         st.error(f"Failed to load mock picks: {e}")
         return
-
     taken_keys, pos_history = map_taken_from_picks(picks, players_index)
 
-    teams = 12  # assume for mock
+    teams = 12  # generic for public mocks
     roster_positions = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"]
 
     if csv_df is None or csv_df.empty:
@@ -235,7 +281,7 @@ def mock_tab(csv_df, weights):
         return
 
     avail_df, starters = evaluate_players(csv_df, SCORING_DEFAULT, teams, roster_positions, weights, taken_keys)
-    needs = {"QB": 1, "RB": 2, "WR": 2, "TE": 1}  # neutral target
+    needs = {"QB": 1, "RB": 2, "WR": 2, "TE": 1}
     sugg = suggest(avail_df, needs, weights, topk=8)
 
     st.markdown("### Suggested Picks (Top 8)")
@@ -244,6 +290,7 @@ def mock_tab(csv_df, weights):
     st.markdown("### Player Board (Available)")
     show_cols = ["PLAYER", "TEAM", "POS", "TIER", "ADP", "EVAL_PTS", "VBD", "VONA", "INJURY_RISK", "SOS_SEASON"]
     st.dataframe(avail_df[show_cols].sort_values(["VBD", "EVAL_PTS"], ascending=False), use_container_width=True)
+
 
 def board_tab(csv_df, weights):
     st.subheader("Player Board & Filters")
@@ -255,7 +302,9 @@ def board_tab(csv_df, weights):
     roster_positions = st.text_input("Roster positions (comma)", value="QB,RB,RB,WR,WR,TE,FLEX,K,DEF")
     roster_positions = [p.strip().upper() for p in roster_positions.split(",") if p.strip()]
 
-    avail_df, starters = evaluate_players(csv_df, SCORING_DEFAULT, int(teams), roster_positions, weights, current_picks=[])
+    avail_df, starters = evaluate_players(
+        csv_df, SCORING_DEFAULT, int(teams), roster_positions, weights, current_picks=[]
+    )
 
     pos = st.multiselect("Position", ["QB", "RB", "WR", "TE", "K", "DEF"], default=["RB", "WR", "TE", "QB"])
     team = st.text_input("Team filter (e.g., KC, SF)")
@@ -272,7 +321,9 @@ def board_tab(csv_df, weights):
     csv = filt.to_csv(index=False).encode()
     st.download_button("Download filtered board CSV", csv, "filtered_board.csv", "text/csv")
 
-# ---------- Main ----------
+# =========================
+# Main
+# =========================
 
 def main():
     st.title("Fantasy Football Draft Assistant — VBD Overlay")
