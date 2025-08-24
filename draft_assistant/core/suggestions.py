@@ -1,145 +1,84 @@
+# draft_assistant/core/suggestions.py
 from __future__ import annotations
-import os
-from typing import Dict, Optional, Tuple
+
+from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-# --- Tunables (env overrides supported) ---
-QB_SUPPRESS_UNTIL_ROUND = int(os.getenv("FFDA_QB_SUPPRESS_UNTIL_ROUND", "6"))    # hide QB until this round
-QB_EARLY_EDGE_GATE      = float(os.getenv("FFDA_QB_EARLY_EDGE_GATE", "22.0"))    # allow early QB only if QB VBD exceeds best non-QB by this
-QB_STRICT_POCKET_ROUND  = int(os.getenv("FFDA_QB_STRICT_POCKET_ROUND", "7"))     # even stricter for "Pocket QB"
-K_DEF_EARLY_PENALTY_RND = int(os.getenv("FFDA_K_DEF_EARLY_PENALTY_RND", "14"))   # discourage K/DEF before final two rounds
-SCARCITY_TIER_SIZE      = int(os.getenv("FFDA_SCARCITY_TIER_SIZE", "2"))         # if <= this many left in tier, add scarcity bump
-SCARCITY_BUMP           = float(os.getenv("FFDA_SCARCITY_BUMP", "8.0"))
-NEED_BUMP               = float(os.getenv("FFDA_NEED_BUMP", "3.0"))
-NO_NEED_PEN             = float(os.getenv("FFDA_NO_NEED_PEN", "1.5"))
+# Stable, simple suggestion ranking:
+# - VBD-first with small need bump
+# - Suppress early QBs (before R6) unless overwhelming VBD edge
+# - Prefer K/DEF only in last rounds (toggle)
 
-def _z(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    mu = s.mean(skipna=True)
-    sd = s.std(skipna=True)
-    if not np.isfinite(sd) or sd == 0:
-        return pd.Series(np.zeros(len(series)), index=series.index)
-    return (s - mu) / sd
+QB_SUPPRESS_UNTIL_ROUND = 6
+QB_OVERWHELMING_EDGE = 20.0  # allow earlier if QB VBD beats best non-QB by this many points
 
-def _top_vbd(avail_df: pd.DataFrame, pos: str) -> float:
-    pool = avail_df[avail_df["POS"] == pos]
-    if pool.empty:
-        return 0.0
-    srt = pool.sort_values(["VBD","EVAL_PTS"], ascending=False)
-    return float(pd.to_numeric(srt.iloc[0].get("VBD"), errors="coerce") or 0.0)
-
-def _best_non_qb_edge(avail_df: pd.DataFrame) -> float:
-    edges = []
+def _best_non_qb_vbd(df: pd.DataFrame) -> float:
+    mx = -1e9
     for p in ("RB","WR","TE"):
-        edges.append(_top_vbd(avail_df, p))
-    return float(max(edges) if edges else 0.0)
-
-def _apply_position_needs_score(df: pd.DataFrame, base_need: Dict[str,int]) -> pd.DataFrame:
-    # small bump if we still need that position; small penalty if we don't
-    need_adj = []
-    for _, r in df.iterrows():
-        pos = str(r.get("POS") or "")
-        need_adj.append(NEED_BUMP if base_need.get(pos, 0) > 0 else -NO_NEED_PEN)
-    out = df.copy()
-    out["__NEED__"] = need_adj
-    return out
-
-def _scarcity_bump(df: pd.DataFrame) -> pd.DataFrame:
-    """If player is in a small remaining tier (<= SCARCITY_TIER_SIZE), add a bump."""
-    out = df.copy()
-    out["__SCARCITY__"] = 0.0
-    if "TIER" not in df.columns:
-        return out
-    for pos in ("RB","WR","TE","QB"):
-        sub = out[out["POS"] == pos]
-        if sub.empty: 
-            continue
-        for tier, tdf in sub.groupby("TIER"):
-            try:
-                tier_left = len(tdf)
-            except Exception:
-                tier_left = 0
-            if pd.isna(tier) or tier_left == 0:
-                continue
-            if tier_left <= SCARCITY_TIER_SIZE:
-                out.loc[tdf.index, "__SCARCITY__"] = SCARCITY_BUMP
-    return out
-
-def _gate_qb_early(df: pd.DataFrame, avail_df: pd.DataFrame, round_number: int, strategy_name: Optional[str]) -> pd.DataFrame:
-    """Suppress QB in early rounds unless the edge is overwhelming."""
-    if df.empty:
-        return df
-
-    qb_round_gate = QB_SUPPRESS_UNTIL_ROUND
-    if str(strategy_name or "").lower() == "pocket qb":
-        qb_round_gate = max(qb_round_gate, QB_STRICT_POCKET_ROUND)
-
-    qb_edge = _top_vbd(avail_df, "QB")
-    nonqb_edge = _best_non_qb_edge(avail_df)
-
-    qb_allowed_early = (round_number >= qb_round_gate) or (qb_edge >= nonqb_edge + QB_EARLY_EDGE_GATE)
-
-    gated = df.copy()
-    gated["__QB_GATE__"] = 0.0
-    if not qb_allowed_early:
-        gated.loc[gated["POS"] == "QB", "__QB_GATE__"] = -999.0
-    return gated
-
-def _discourage_k_def_too_early(df: pd.DataFrame, round_number: int, total_rounds: int) -> pd.DataFrame:
-    """Heavily discourage K/DEF until the final two rounds."""
-    if df.empty:
-        return df
-    gated = df.copy()
-    gated["__KDEF_PEN__"] = 0.0
-    if round_number < max(1, total_rounds - 1):
-        if round_number < K_DEF_EARLY_PENALTY_RND:
-            gated.loc[gated["POS"].isin(["K","DEF"]), "__KDEF_PEN__"] = -250.0
-    return gated
+        sub = df[df["POS"] == p]
+        if not sub.empty:
+            v = float(pd.to_numeric(sub["VBD"], errors="coerce").max())
+            mx = max(mx, v)
+    return 0.0 if mx == -1e9 else mx
 
 def suggest(
     avail_df: pd.DataFrame,
     base_need: Dict[str,int],
-    weights: Dict[str, float] | None = None,
-    topk: int = 8,
-    strategy_name: Optional[str] = None,
-    round_number: int = 1,
-    total_rounds: int = 15,
+    round_number: int,
+    total_rounds: int,
+    strategy_name: Optional[str] = "Balanced",
+    qb_cap: int = 2,
+    k_def_last_rounds_only: bool = True,
 ) -> pd.DataFrame:
-    """
-    Rank candidates for the current pick. Returns df with 'score' column, sorted desc.
-
-    Core rules:
-      - VBD-first scoring (with a small EVAL_PTS stabilizer).
-      - Tier scarcity bump (if <= SCARCITY_TIER_SIZE remain in their tier).
-      - Needs-aware nudge.
-      - **Hard early QB suppression** unless the edge is truly massive.
-      - **K/DEF discouraged** until late (final two rounds).
-    """
     if avail_df is None or avail_df.empty:
-        return pd.DataFrame(columns=["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","score"])
+        return pd.DataFrame(columns=["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","WHY"])
 
-    cand = avail_df.copy()
+    df = avail_df.copy()
+    # Early QB suppression
+    if round_number < QB_SUPPRESS_UNTIL_ROUND:
+        best_non_qb = _best_non_qb_vbd(df)
+        df_qb = df[df["POS"] == "QB"].copy()
+        if not df_qb.empty:
+            top_qb = float(pd.to_numeric(df_qb["VBD"], errors="coerce").max())
+            if top_qb < best_non_qb + QB_OVERWHELMING_EDGE:
+                df = df[df["POS"] != "QB"]
 
-    # Base scoring: mostly VBD, with a small EVAL_PTS stabilizer
-    vbd = pd.to_numeric(cand.get("VBD"), errors="coerce").fillna(0.0)
-    eval_z = _z(cand.get("EVAL_PTS")) if "EVAL_PTS" in cand.columns else pd.Series(np.zeros(len(cand)), index=cand.index)
-    cand["__BASE__"] = (0.88 * vbd) + (0.12 * eval_z)
+    # K/DEF late preference
+    if k_def_last_rounds_only and round_number < max(1, total_rounds - 1):
+        df = df[~df["POS"].isin(["K","DEF"])]
 
-    # Needs & scarcity
-    cand = _apply_position_needs_score(cand, base_need)
-    cand = _scarcity_bump(cand)
+    # Need bump (+2 if we still need that position), light penalty otherwise
+    need_adj = []
+    for _, r in df.iterrows():
+        pos = str(r.get("POS") or "")
+        need_adj.append(2.0 if base_need.get(pos, 0) > 0 else -0.5)
+    df["__NEED__"] = need_adj
 
-    # Gating
-    cand = _gate_qb_early(cand, avail_df, round_number, strategy_name)
-    cand = _discourage_k_def_too_early(cand, round_number, total_rounds)
+    # Final score: VBD + need
+    vbd = pd.to_numeric(df["VBD"], errors="coerce").fillna(0.0)
+    df["score"] = vbd + df["__NEED__"]
 
-    # Final score
-    for col in ("__QB_GATE__", "__KDEF_PEN__", "__NEED__", "__SCARCITY__", "__BASE__"):
-        if col not in cand.columns:
-            cand[col] = 0.0
-    cand["score"] = cand["__BASE__"] + cand["__NEED__"] + cand["__SCARCITY__"] + cand["__QB_GATE__"] + cand["__KDEF_PEN__"]
+    # QB cap at display time (don't show more than remaining QB quota)
+    if qb_cap <= 0 or base_need.get("QB", 0) <= 0:
+        df = pd.concat([df[df["POS"] != "QB"], df[df["POS"] == "QB"].head(0)], ignore_index=True)
+    else:
+        have_qb = 0  # handled by base_need (remaining desired QBs)
+        remaining = max(0, qb_cap - max(0, have_qb))
+        non = df[df["POS"] != "QB"]
+        qbs = df[df["POS"] == "QB"].head(remaining)
+        df = pd.concat([non, qbs], ignore_index=True)
 
-    out_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","score"]
-    cand = cand.sort_values("score", ascending=False)
-    return cand[out_cols].head(int(topk)).reset_index(drop=True)
+    df = df.sort_values(["score", "VBD", "EVAL_PTS"], ascending=False)
+
+    # Plain-English WHY
+    whys = []
+    for _, r in df.iterrows():
+        why = f"VBD {float(r['VBD']):.1f}"
+        if base_need.get(r["POS"], 0) > 0:
+            why += f"; you still need {r['POS']}"
+        whys.append(why)
+    df["WHY"] = whys
+
+    out_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","WHY","score"]
+    return df[out_cols]
