@@ -207,7 +207,7 @@ def _tier_depth(avail_df: pd.DataFrame, pos: str) -> Tuple[int, float]:
     edge = float(top.iloc[0].get("VBD", 0.0))
     return depth, edge
 
-# ---------- slot detection (fix for Strategy Health = 0) ----------
+# ---------- slot detection ----------
 def _resolve_user_id(users: List[dict], username_or_display: str) -> Optional[str]:
     want = (username_or_display or "").strip().lower()
     if not want:
@@ -248,6 +248,43 @@ def _detect_my_slot(users: List[dict], draft_meta: dict, pick_log: List[dict], s
 
     # fallback
     return 1
+
+# ---------- NEW: direct raw counter fallback for owned counts ----------
+def _count_owned_for_slot_raw(raw_picks: List[dict], players_map: dict, my_slot: int) -> Dict[str,int]:
+    """
+    Fallback counter: if team map returns zeros, count my owned positions
+    directly from the raw Sleeper picks using draft_slot/roster_id.
+    """
+    counts = {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0}
+    if my_slot <= 0:
+        return counts
+
+    for p in raw_picks or []:
+        # prefer draft_slot; fallback to roster_id
+        slot = p.get("draft_slot", p.get("roster_id", 0))
+        try:
+            slot = int(slot)
+        except Exception:
+            slot = 0
+        if slot != my_slot:
+            continue
+
+        meta = p.get("metadata") or {}
+        pos = (meta.get("position") or "").strip().upper()
+        if not pos:
+            pid = p.get("player_id")
+            if pid and players_map:
+                pm = players_map.get(pid) or {}
+                pos = (pm.get("position") or "").strip().upper()
+
+        # normalize defense labels
+        if pos in ("DST","D/ST","DEFENSE","TEAM D","TEAM DEF"):
+            pos = "DEF"
+
+        if pos in counts:
+            counts[pos] += 1
+
+    return counts
 
 # =========================
 # K/DEF + QB cap helpers
@@ -560,6 +597,9 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         f"**Current Pick:** Round {rnd}, Pick {pick_in_rnd} — **{team_display}** on the clock."
         + (" 🎯 _(That’s you)_" if you_on_clock else "")
     )
+    # NEW: small caption to confirm which slot source is used
+    manual_used = (seat_override is not None and int(seat_override) > 0)
+    st.caption(f"Using draft slot: {my_slot} ({'manual' if manual_used else 'auto-detected'})")
 
     if csv_df is None or csv_df.empty:
         st.warning("Upload/load your player file in the sidebar.")
@@ -574,9 +614,13 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         current_picks=taken_keys, next_pick_window=picks_until_next
     )
 
-    # Owned counts from normalized log — now keyed by true slot
+    # Owned counts from normalized log — keyed by my (resolved) slot
     team_counts = _team_pos_counts_from_log(pick_log, teams)
     my_counts = team_counts.get(my_slot, {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0})
+
+    # >>> NEW FALLBACK: if zeros but there are picks, use raw counter with my manual slot <<<
+    if sum(my_counts.values()) == 0 and len(raw_picks) > 0 and my_slot > 0:
+        my_counts = _count_owned_for_slot_raw(raw_picks, players_map, my_slot)
 
     my_next_overall = next_overall + picks_until_next
     between_slots = _slots_between(next_overall, my_next_overall, teams)
