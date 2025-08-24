@@ -30,6 +30,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 QB_ROSTER_CAP = int(os.environ.get("FFDA_QB_CAP", "2"))
 INCLUDE_K_DEF_EARLY = bool(int(os.environ.get("FFDA_INCLUDE_K_DEF_EARLY", "0")))
+ADP_GUARD_TOL = int(os.environ.get("FFDA_ADP_GUARD_TOL", "2"))  # how many picks earlier than current we allow
 
 # =========================
 # Cache
@@ -95,13 +96,20 @@ def sidebar_controls():
 # =========================
 
 def compute_next_pick_window(teams: int, seat: int, current_overall_pick: int) -> int:
+    """How many selections until your NEXT turn (not counting your current pick)."""
     if not (1 <= seat <= teams):
         return teams
     rnd = (current_overall_pick - 1) // teams + 1
     pos = (current_overall_pick - 1) % teams + 1
     my_pos_this = seat if rnd % 2 == 1 else (teams - seat + 1)
-    if my_pos_this >= pos:
+    if my_pos_this > pos:
+        # your pick is later this round
         return my_pos_this - pos
+    if my_pos_this == pos:
+        # you're on the clock; your next turn is at the wrap
+        my_pos_next = (teams - seat + 1) if rnd % 2 == 1 else seat
+        return my_pos_next  # at pick 12, this returns 1 (12->13)
+    # your pick already happened this round; wait until next round’s slot
     my_pos_next = (teams - seat + 1) if rnd % 2 == 1 else seat
     return (teams - pos) + my_pos_next
 
@@ -219,13 +227,15 @@ def _resolve_user_id(users: List[dict], username_or_display: str) -> Optional[st
             return u.get("user_id")
     return None
 
-def _detect_my_slot(users: List[dict], draft_meta: dict, pick_log: List[dict], seat_override: int, username: str) -> int:
+def _detect_my_slot(users: List[dict], draft_meta: dict, pick_log: List[dict], seat_override: int, username: str, rosters: List[dict]) -> int:
     # 1) manual override
     if int(seat_override) > 0:
         return int(seat_override)
 
-    # 2) via draft.draft_order (user_id -> slot)
+    # determine my user id
     my_uid = _resolve_user_id(users, username)
+
+    # 2) via draft.draft_order (user_id -> slot)
     draft_order = draft_meta.get("draft_order") if isinstance(draft_meta, dict) else None
     if my_uid and isinstance(draft_order, dict):
         slot = draft_order.get(my_uid)
@@ -235,7 +245,18 @@ def _detect_my_slot(users: List[dict], draft_meta: dict, pick_log: List[dict], s
             except Exception:
                 pass
 
-    # 3) via pick log (first pick with team == my user_id)
+    # 3) via rosters (owner_id -> roster_id)
+    if my_uid:
+        for r in rosters or []:
+            if str(r.get("owner_id","")) == str(my_uid):
+                try:
+                    rid = int(r.get("roster_id", 0))
+                    if rid > 0:
+                        return rid
+                except Exception:
+                    pass
+
+    # 4) via pick log (first pick with team == my user_id)
     if my_uid:
         for p in pick_log or []:
             if str(p.get("team") or "") == str(my_uid):
@@ -251,14 +272,9 @@ def _detect_my_slot(users: List[dict], draft_meta: dict, pick_log: List[dict], s
 
 # ---------- direct raw counter fallback for owned counts ----------
 def _count_owned_for_slot_raw(raw_picks: List[dict], players_map: dict, my_slot: int) -> Dict[str,int]:
-    """
-    Fallback counter: if team map returns zeros, count my owned positions
-    directly from the raw Sleeper picks using draft_slot/roster_id.
-    """
     counts = {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0}
     if my_slot <= 0:
         return counts
-
     for p in raw_picks or []:
         slot = p.get("draft_slot", p.get("roster_id", 0))
         try:
@@ -267,7 +283,6 @@ def _count_owned_for_slot_raw(raw_picks: List[dict], players_map: dict, my_slot:
             slot = 0
         if slot != my_slot:
             continue
-
         meta = p.get("metadata") or {}
         pos = (meta.get("position") or "").strip().upper()
         if not pos:
@@ -275,13 +290,10 @@ def _count_owned_for_slot_raw(raw_picks: List[dict], players_map: dict, my_slot:
             if pid and players_map:
                 pm = players_map.get(pid) or {}
                 pos = (pm.get("position") or "").strip().upper()
-
         if pos in ("DST","D/ST","DEFENSE","TEAM D","TEAM DEF"):
             pos = "DEF"
-
         if pos in counts:
             counts[pos] += 1
-
     return counts
 
 # =========================
@@ -537,6 +549,18 @@ def render_strategy_health(my_counts: Dict[str,int], targets: Dict[str,int], pla
             st.warning(m)
 
 # =========================
+# ADP guard (fallback when picks aren't synced)
+# =========================
+
+def _apply_adp_guard(df: pd.DataFrame, next_overall: int) -> pd.DataFrame:
+    if df is None or df.empty or "ADP" not in df.columns:
+        return df
+    # Hide players whose ADP is earlier than (next_overall - tolerance)
+    floor_adp = max(1, next_overall - ADP_GUARD_TOL)
+    keep = df["ADP"].isna() | (pd.to_numeric(df["ADP"], errors="coerce") >= floor_adp)
+    return df[keep].reset_index(drop=True)
+
+# =========================
 # Live tab (Suggested Picks on top; no Player Board)
 # =========================
 
@@ -598,8 +622,8 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     rnd, pick_in_rnd, slot_on_clock = snake_position(next_overall, teams)
     team_display = slot_to_display_name(slot_on_clock, users, rosters)
 
-    # robust slot resolution
-    my_slot = _detect_my_slot(users, draft_meta, pick_log, seat_override, username)
+    # robust slot resolution (now also uses rosters)
+    my_slot = _detect_my_slot(users, draft_meta, pick_log, seat_override, username, rosters)
     you_on_clock = (slot_on_clock == my_slot)
 
     st.markdown(
@@ -616,11 +640,19 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     # Availability (remove drafted by name)
     picked_names = sleeper.picked_player_names(raw_picks, players_map)
     taken_keys = [norm_name(n) for n in picked_names]
+
+    # Picks until next (correct at turn)
     picks_until_next = compute_next_pick_window(teams, my_slot, next_overall)
+
     avail_df, _ = evaluate_players(
         csv_df, SCORING_DEFAULT, teams, roster_positions, weights,
         current_picks=taken_keys, next_pick_window=picks_until_next
     )
+
+    # ADP guard fallback when picks appear missing (e.g., API returned 0)
+    if len(raw_picks) < next_overall - 1:
+        # We expect next_overall-1 picks exist; if not, hide unrealistic early-ADP names
+        avail_df = _apply_adp_guard(avail_df, next_overall)
 
     # Owned counts
     team_counts = _team_pos_counts_from_log(pick_log, teams)
@@ -722,6 +754,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     with st.expander("Debug (Live)"):
         st.caption(f"Picks fetched (normalized): {len(pick_log)}")
         st.caption(f"Resolved my_slot: {my_slot} | On clock slot: {slot_on_clock}")
+        st.caption(f"Expected picks so far: {next_overall-1} | Raw picks returned: {len(raw_picks)}")
         st.caption(f"Picks until next: {picks_until_next} | Recent runs: {runs}")
         st.caption(f"Owned counts (my team): {my_counts}")
 
@@ -821,6 +854,10 @@ def mock_tab(csv_df, weights, include_k_def_anytime):
     avail_df, _ = evaluate_players(
         csv_df, SCORING_DEFAULT, teams, roster_positions, weights, current_picks=taken_keys, next_pick_window=teams
     )
+    # ADP guard in practice too (if picks appear behind)
+    if len(picks) < next_overall - 1:
+        avail_df = _apply_adp_guard(avail_df, next_overall)
+
     S["available"] = avail_df.reset_index(drop=True)
     st.session_state.mock_state = S
 
