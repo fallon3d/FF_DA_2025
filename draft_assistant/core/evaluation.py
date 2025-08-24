@@ -1,252 +1,302 @@
 from __future__ import annotations
 from typing import Dict, List, Tuple, Optional
-import pandas as pd
+import math
 import numpy as np
+import pandas as pd
 
-from draft_assistant.core.utils import (
-    ensure_player_cols,
-    starters_from_roster_positions,
-    apply_flex_adjustment,
-)
+# We only import this helper from our utils to compute starters per position
+from .utils import starters_from_roster_positions
 
-# ---------------------------------------------------------------------
-# League Scoring Defaults (aligned to your settings)
-# ---------------------------------------------------------------------
-SCORING_DEFAULT: Dict[str, float] = {
-    # Passing
-    "pass_yd": 0.04,     # 25 yards = 1
-    "pass_td": 4.0,
-    "pass_int": -1.0,
-    "two_pt": 2.0,       # generic 2-pt convs (pass/rush/rec if provided)
-
-    # Rushing
-    "rush_yd": 0.10,     # 10 yards = 1
-    "rush_td": 6.0,
-
-    # Receiving
-    "rec": 1.0,          # PPR
-    "rec_yd": 0.10,      # 10 yards = 1
-    "rec_td": 6.0,
-
-    # Kicking (coarse buckets; map your projection columns if present)
-    "fg_0_39": 3.0,      # covers 0–19, 20–29, 30–39 as +3
-    "fg_40_49": 4.0,
-    "fg_50_59": 5.0,     # 50+
-    "fg_miss": -1.0,
-    "pat": 1.0,
-    "pat_miss": -1.0,
-
-    # Defense / Special Teams
-    "sack": 1.0,
-    "int": 2.0,
-    "fr": 2.0,
-    "safety": 2.0,
-    "td": 6.0,
-    "blk": 2.0,          # blocked kick
-    "ff": 1.0,           # forced fumble
-
-    # Points Allowed tiers
-    "pa_0": 10.0,
-    "pa_1_6": 7.0,
-    "pa_7_13": 4.0,
-    "pa_14_20": 1.0,
-    "pa_28_34": -1.0,
-    "pa_35p": -4.0,
+# ------------- Defaults (kept backward compatible) -------------
+SCORING_DEFAULT = {
+    # multipliers in evaluation (small, additive on top of 1.0)
+    "sos_w": 0.03,          # Strength of schedule magnitude
+    "def_w": 0.02,          # Opponent defense (EPA/explosive/RZTD) influence magnitude
+    "tend_w": 0.02,         # TEAM_TENDENCY bump magnitude
+    "passrate_w": 0.025,    # PROE/neutral-pass-rate magnitude
+    "vol_w": 0.015,         # Volatility penalty magnitude (small, global)
+    "inj_w": 0.04,          # Injury penalty magnitude (global)
+    # value/vbd mixing happens later in suggest() – here we produce EVAL_PTS + VBD
 }
 
-# ---------------------------------------------------------------------
-# Projection & Context Layer
-# ---------------------------------------------------------------------
+# ------------- Small helpers -------------
 
-def recompute_proj_pts_if_components(df: pd.DataFrame, scoring: Dict[str, float]) -> pd.DataFrame:
+def _col(df: pd.DataFrame, *names: str) -> Optional[str]:
+    """Return the first matching column name (case-insensitive)."""
+    lower = {c.lower(): c for c in df.columns}
+    for n in names:
+        if n.lower() in lower:
+            return lower[n.lower()]
+    return None
+
+def _to_num(x, default=np.nan) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, str):
+            sx = x.strip()
+            if sx == "":
+                return default
+            return float(sx)
+        return float(x)
+    except Exception:
+        return default
+
+def _safe_upper(x: str) -> str:
+    return str(x or "").strip().upper()
+
+def _map_volatility(v) -> float:
+    """Return [0..1] risk index. Higher means more volatile."""
+    s = str(v or "").strip().lower()
+    if s in ("low","l","0"):
+        return 0.15
+    if s in ("medium","med","m","1"):
+        return 0.45
+    if s in ("high","h","2"):
+        return 0.75
+    # if numeric
+    fv = _to_num(v, default=np.nan)
+    if pd.notna(fv):
+        # clamp to [0..1]
+        return float(max(0.0, min(1.0, fv)))
+    return 0.45
+
+def _map_injury(v) -> float:
+    """Return [0..1] injury risk index. Higher means more risk."""
+    s = str(v or "").strip().lower()
+    if s in ("low","l","0"):
+        return 0.15
+    if s in ("medium","med","m","1"):
+        return 0.45
+    if s in ("high","h","2"):
+        return 0.75
+    fv = _to_num(v, default=np.nan)
+    if pd.notna(fv):
+        return float(max(0.0, min(1.0, fv)))
+    return 0.35
+
+def _map_sos(v) -> float:
+    """Return small +/- bump; 'EASY' positive, 'HARD' negative."""
+    s = _safe_upper(v)
+    if "EASY" in s:
+        return +1.0
+    if "HARD" in s or "TOUGH" in s or "DIFFICULT" in s:
+        return -1.0
+    if s in ("AVG","AVERAGE","MED","MEDIUM","NEUTRAL"):
+        return 0.0
+    # numeric sos: center at 0 via sign
+    fv = _to_num(v, default=np.nan)
+    if pd.notna(fv):
+        # treat higher as easier if that matches your encoding; if inverted, flip sign
+        return float(np.sign(fv))
+    return 0.0
+
+def _z(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    mu = s.mean(skipna=True)
+    sd = s.std(skipna=True)
+    if not np.isfinite(sd) or sd == 0:
+        return pd.Series(np.zeros(len(series)), index=series.index)
+    return (s - mu) / sd
+
+def _norm_pos(p: str) -> str:
+    p = _safe_upper(p)
+    if p in ("DST","D/ST","D-ST","TEAM D","TEAM DEF","DEFENSE"):
+        return "DEF"
+    return p
+
+# ------------- Replacement / VBD helpers -------------
+
+def _replacement_points(pos_df: pd.DataFrame, starters_total: int) -> float:
     """
-    If component stat columns exist, rebuild PROJ_PTS from league scoring.
-    Otherwise, leave PROJ_PTS as provided.
-    Supported (optional): PASS_YDS, PASS_TD, PASS_INT, RUSH_YDS, RUSH_TD,
-                          REC, REC_YDS, REC_TD, TWO_PT
+    Replacement is the EVAL_PTS at the last starting spot in the league.
+    E.g., 12 teams * 2 RB starters => RB replacement = RB at rank 24.
+    If not enough players, use min(EVAL_PTS).
     """
-    df = df.copy()
-    cols = set(df.columns)
+    if pos_df.empty:
+        return 0.0
+    srt = pos_df.sort_values(["EVAL_PTS"], ascending=False).reset_index(drop=True)
+    idx = max(0, min(len(srt) - 1, starters_total - 1))
+    val = float(srt.iloc[idx]["EVAL_PTS"])
+    return val
 
-    has_rec = any(c in cols for c in ("REC", "REC_YDS", "REC_TD"))
-    has_rush = any(c in cols for c in ("RUSH_YDS", "RUSH_TD"))
-    has_pass = any(c in cols for c in ("PASS_YDS", "PASS_TD", "PASS_INT"))
+def _starters_map(teams: int, roster_positions: List[str]) -> Dict[str, int]:
+    base = starters_from_roster_positions(roster_positions or ["QB","RB","RB","WR","WR","TE","FLEX","K","DEF"])
+    # guarantee at least 1 starter slot for singleton positions
+    for p in ("QB","TE","K","DEF"):
+        base[p] = max(1, int(base.get(p, 0)))
+    base["RB"] = max(1, int(base.get("RB", 0)))
+    base["WR"] = max(1, int(base.get("WR", 0)))
+    return base
 
-    if not (has_rec or has_rush or has_pass):
-        return df  # use existing PROJ_PTS
-
-    pts = np.zeros(len(df), dtype=float)
-
-    # Passing
-    if "PASS_YDS" in cols: pts += df["PASS_YDS"].fillna(0).astype(float) * scoring.get("pass_yd", 0.04)
-    if "PASS_TD" in cols:  pts += df["PASS_TD"].fillna(0).astype(float)  * scoring.get("pass_td", 4.0)
-    if "PASS_INT" in cols: pts += df["PASS_INT"].fillna(0).astype(float) * scoring.get("pass_int", -1.0)
-
-    # Rushing
-    if "RUSH_YDS" in cols: pts += df["RUSH_YDS"].fillna(0).astype(float) * scoring.get("rush_yd", 0.10)
-    if "RUSH_TD" in cols:  pts += df["RUSH_TD"].fillna(0).astype(float)  * scoring.get("rush_td", 6.0)
-
-    # Receiving
-    if "REC" in cols:      pts += df["REC"].fillna(0).astype(float)      * scoring.get("rec", 1.0)
-    if "REC_YDS" in cols:  pts += df["REC_YDS"].fillna(0).astype(float)  * scoring.get("rec_yd", 0.10)
-    if "REC_TD" in cols:   pts += df["REC_TD"].fillna(0).astype(float)   * scoring.get("rec_td", 6.0)
-
-    # Generic two-point conversions (optional as total)
-    if "TWO_PT" in cols:   pts += df["TWO_PT"].fillna(0).astype(float)   * scoring.get("two_pt", 2.0)
-
-    df["PROJ_PTS"] = pts
-    return df
-
-
-def apply_context_adjustments(df: pd.DataFrame, weights: Dict[str, float]) -> pd.DataFrame:
-    """
-    Apply contextual adjustments on top of PROJ_PTS:
-      - Injury penalty (INJURY_VAL ~ 0..0.2 typical), capped to avoid over-penalizing
-      - Schedule strength (SOS_SEASON z-score; if higher means harder, penalize)
-      - Usage/Upside composite: TGT_SHARE, RUSH_SHARE, GOAL_LINE_SHARE, ROUTE_PCT, REDZONE_TGT
-    """
-    df = df.copy()
-    eval_pts = df["PROJ_PTS"].fillna(0).astype(float).values
-
-    # Injury penalty
-    inj = df.get("INJURY_VAL", pd.Series([np.nan] * len(df))).fillna(0.0).astype(float).values
-    eval_pts *= (1 - np.clip(inj * float(weights.get("inj_w", 0.5)), 0.0, 0.6))
-
-    # Schedule strength (z-score). If higher SOS = tougher, negative weight.
-    sos = df.get("SOS_SEASON", pd.Series([np.nan] * len(df))).astype(float)
-    if sos.notna().sum() >= 5 and float(sos.std(ddof=0)) > 1e-9:
-        z = (sos - sos.mean()) / sos.std(ddof=0)
-        eval_pts *= (1 + (-z.fillna(0).values) * float(weights.get("sos_w", 0.05)))
-
-    # Usage / role-based upside
-    usage_cols = ["TGT_SHARE", "RUSH_SHARE", "GOAL_LINE_SHARE", "ROUTE_PCT", "REDZONE_TGT"]
-    usage = df[usage_cols].copy()
-    for c in usage_cols:
-        if c not in usage:
-            usage[c] = np.nan
-    usage = usage.fillna(usage.median(numeric_only=True))
-    # Percentile rank each metric then average to 0..1
-    usage_score = usage.rank(pct=True).mean(axis=1).values
-    eval_pts *= (1 + usage_score * float(weights.get("usage_w", 0.05)))
-
-    df["EVAL_PTS"] = eval_pts
-    return df
-
-# ---------------------------------------------------------------------
-# Replacement, VBD & VONA
-# ---------------------------------------------------------------------
-
-def _fallback_starters_if_empty(roster_positions: List[str]) -> List[str]:
-    """Fallback to a standard lineup if Sleeper did not provide roster_positions."""
-    return roster_positions or ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"]
-
-
-def compute_replacement_points(
-    df: pd.DataFrame,
-    teams: int,
-    starters: Dict[str, int]
-) -> Dict[str, float]:
-    """
-    Compute per-position replacement EVAL_PTS:
-      - Replacement rank approx = teams * starters_at_pos - 1 (zero-index)
-      - If a pos has 0 explicit starters, fall back to ~teams-1
-      - Apply FLEX adjustment so RB/WR/TE baselines include the effect of FLEX slots
-    """
-    # Determine rank (index) of replacement-level player for each position
-    repl_ranks: Dict[str, int] = {}
-    for pos in ["QB", "RB", "WR", "TE", "K", "DEF"]:
-        count = int(starters.get(pos, 0) or 0)
-        rank = max(teams * count - 1, teams - 1)  # zero-index
-        repl_ranks[pos] = max(rank, 0)
-
-    # Lookup replacement points
-    repl_pts: Dict[str, float] = {}
-    for pos, rank in repl_ranks.items():
-        sub = df[df["POS"] == pos].sort_values("EVAL_PTS", ascending=False)
-        if len(sub) == 0:
-            repl_pts[pos] = 0.0
-        else:
-            idx = min(rank, len(sub) - 1)
-            repl_pts[pos] = float(sub.iloc[idx]["EVAL_PTS"])
-
-    # FLEX adjustment (raises baseline for RB/WR/TE if FLEX increases the marginal starter)
-    repl_pts = apply_flex_adjustment(df, int(teams), starters, repl_pts)
-    return repl_pts
-
-
-def add_vbd_and_vona(
-    df: pd.DataFrame,
-    teams: int,
-    starters: Dict[str, int],
-    next_pick_window: Optional[int] = None
-) -> pd.DataFrame:
-    """
-    Add VBD and VONA to the dataframe.
-      - VBD  = EVAL_PTS - replacement_pts_at_position
-      - VONA ≈ EVAL_PTS - EVAL_PTS_of_pos_player_likely_available_at_next_pick
-        (using an estimated window of picks until your next selection)
-    """
-    df = df.copy()
-    repl_pts = compute_replacement_points(df, teams, starters)
-    df["VBD"] = df.apply(lambda r: float(r["EVAL_PTS"] - repl_pts.get(r["POS"], 0.0)), axis=1)
-
-    # Window: number of picks until your next turn (snake-aware caller can pass this in)
-    window = int(next_pick_window) if (next_pick_window is not None and next_pick_window > 0) else int(teams)
-
-    vona_map: Dict[str, float] = {}
-    for pos in ["QB", "RB", "WR", "TE"]:
-        sub = df[df["POS"] == pos].sort_values("EVAL_PTS", ascending=False)
-        if len(sub) == 0:
-            vona_map[pos] = 0.0
-        else:
-            idx = min(window, len(sub) - 1)
-            vona_map[pos] = float(sub.iloc[idx]["EVAL_PTS"])
-
-    df["VONA"] = df.apply(lambda r: float(r["EVAL_PTS"] - vona_map.get(r["POS"], 0.0)), axis=1)
-    return df
-
-# ---------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------
+# ------------- Main: evaluate_players -------------
 
 def evaluate_players(
-    raw_df: pd.DataFrame,
+    df: pd.DataFrame,
     scoring: Dict[str, float],
     teams: int,
     roster_positions: List[str],
-    weights: Dict[str, float],
-    current_picks: List[str],
-    next_pick_window: Optional[int] = None,   # <-- supports snake-aware VONA
-) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    weights: Dict[str, float] | None = None,
+    current_picks: List[str] | None = None,
+    next_pick_window: int | None = None,
+    strategy_name: str | None = None,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
-    Main entry point.
-    Returns:
-      - avail_df: Available players with EVAL_PTS, VBD, VONA
-      - starters: Dict of starting slot counts per position (incl. FLEX)
+    Returns (available_df, replacement_by_pos).
+    Adds/updates columns: POS, TEAM, EVAL_PTS, VBD.
+    - df is the unified player table (already normalized by your loader).
+    - Uses many optional columns if present; handles missing gracefully.
     """
-    # Normalize columns, ensure minimal schema
-    df = ensure_player_cols(raw_df)
+    if df is None or df.empty:
+        return pd.DataFrame([]), {}
 
-    # Optionally recompute PROJ_PTS from component stats using league scoring
-    df = recompute_proj_pts_if_components(df, scoring or SCORING_DEFAULT)
+    df = df.copy()
 
-    # Apply contextual adjustments (injury, SOS, usage)
-    df = apply_context_adjustments(df, weights or {"inj_w": 0.5, "sos_w": 0.05, "usage_w": 0.05})
+    # Column mapping
+    c_player = _col(df, "PLAYER", "Name", "Player") or "PLAYER"
+    c_team   = _col(df, "TEAM", "Tm", "Team") or "TEAM"
+    c_pos    = _col(df, "POS", "Position") or "POS"
 
-    # Remove taken players (normalized key match)
-    taken_keys = set([k for k in (current_picks or []) if isinstance(k, str)])
-    avail = df[~df["PLAYER_KEY"].isin(taken_keys)].copy()
+    # Projections: prefer PROJ_PTS, else PROJ, else 0
+    c_proj   = _col(df, "PROJ_PTS", "PROJ", "PROJECTED_PTS", "PROJECTION")
+    if c_proj is None:
+        df["__BASE_PROJ__"] = 0.0
+    else:
+        df["__BASE_PROJ__"] = pd.to_numeric(df[c_proj], errors="coerce").fillna(0.0)
 
-    # Determine starters/slots
-    roster_positions = _fallback_starters_if_empty(roster_positions or [])
-    starters = starters_from_roster_positions(roster_positions)
+    # Common helpers
+    c_adp    = _col(df, "ADP")
+    c_ecr    = _col(df, "ECR", "RANK_ECR")
+    c_tier   = _col(df, "TIER")
+    c_bye    = _col(df, "BYE", "BYE_WEEK")
 
-    # Add VBD & VONA
-    avail = add_vbd_and_vona(
-        avail,
-        teams=int(teams or 12),
-        starters=starters,
-        next_pick_window=next_pick_window,
-    )
+    # Advanced fields
+    c_sos    = _col(df, "SOS_SEASON", "SOS", "SCHEDULE_STRENGTH")
+    c_vol    = _col(df, "VOLATILITY", "VOLATILITY_CAT")
+    c_tend   = _col(df, "TEAM_TENDENCY")
+    c_npr    = _col(df, "NEUTRAL_PASS_RATE_2024", "NEUTRAL_PASS_RATE")
+    c_proe   = _col(df, "PROE_2024", "PROE")
+    c_depa   = _col(df, "DST_DEF_EPA_PER_PLAY", "DEF_EPA_PER_PLAY_ALLOWED")
+    c_expl   = _col(df, "DST_EXPLOSIVE_PLAYS_ALLOWED", "DEF_EXPLOSIVE_ALLOWED")
+    c_rztd   = _col(df, "DST_RZ_TD_ALLOWED_RATE", "DEF_RZ_TD_ALLOWED_RATE")
+    c_inj    = _col(df, "INJURY_RISK", "INJURY", "INJURY_TAG")
 
-    return avail, starters
+    # Normalize positions and essential columns
+    df["POS"] = df[c_pos].map(_norm_pos) if c_pos in df else "WR"
+    df["TEAM"] = df[c_team] if c_team in df else ""
+
+    # --- weights (fallback to SCORING_DEFAULT) ---
+    W = dict(SCORING_DEFAULT)
+    if isinstance(scoring, dict):
+        W.update({k: v for k, v in scoring.items() if isinstance(v, (int, float))})
+    if isinstance(weights, dict):
+        # allow sidebar weights to override (inj_w, etc.)
+        for k in ("inj_w","sos_w","vol_w","def_w","tend_w","passrate_w"):
+            if k in weights and isinstance(weights[k], (int, float)):
+                W[k] = float(weights[k])
+
+    # --- schedule / defense / tendency signals ---
+    sos_sig = _z(df[c_sos]) if c_sos else pd.Series(np.zeros(len(df)), index=df.index)
+    if c_sos:
+        # coarsen to signed magnitude based on EASY/HARD textual when present
+        sos_sign = df[c_sos].map(_map_sos)
+        # combine text sign with z-score magnitude lightly
+        sos_sig = sos_sign * (1.0 + 0.25 * sos_sig.fillna(0.0))
+
+    depa_sig = _z(df[c_depa]) if c_depa else 0.0
+    expl_sig = _z(df[c_expl]) if c_expl else 0.0
+    rztd_sig = _z(df[c_rztd]) if c_rztd else 0.0
+    # higher DEF allowed metrics -> easier matchup for offenses
+    def_sig = (depa_sig + expl_sig + rztd_sig) / 3.0 if isinstance(depa_sig, pd.Series) else pd.Series(np.zeros(len(df)), index=df.index)
+
+    passrate_sig = None
+    if c_npr and c_proe:
+        passrate_sig = 0.5 * _z(df[c_npr]) + 0.5 * _z(df[c_proe])
+    elif c_npr:
+        passrate_sig = _z(df[c_npr])
+    elif c_proe:
+        passrate_sig = _z(df[c_proe])
+    else:
+        passrate_sig = pd.Series(np.zeros(len(df)), index=df.index)
+
+    # TEAM_TENDENCY — tiny bump
+    tend_sig = pd.Series(np.zeros(len(df)), index=df.index)
+    if c_tend:
+        t = df[c_tend].astype(str).str.upper()
+        tend_sig = np.where(t.str.contains("PASS"),  +1.0,
+                     np.where(t.str.contains("RUN"), -1.0, 0.0))
+        tend_sig = pd.Series(tend_sig, index=df.index)
+
+    # Volatility & Injury
+    vol_idx = df[c_vol].map(_map_volatility) if c_vol else pd.Series(np.zeros(len(df)) + 0.35, index=df.index)
+    inj_idx = df[c_inj].map(_map_injury)     if c_inj else pd.Series(np.zeros(len(df)) + 0.25, index=df.index)
+
+    # --- Position-aware modifiers ---
+    pos = df["POS"]
+
+    # start with base projections
+    base_proj = df["__BASE_PROJ__"].astype(float)
+
+    # schedule & defense easier -> positive bump (small)
+    sched_bump = W["sos_w"] * sos_sig
+    def_bump   = W["def_w"] * def_sig
+
+    # pass tendencies benefit pass-catchers, hurt RB a touch
+    pass_bump = W["passrate_w"] * passrate_sig
+    pass_bump = np.where(pos.isin(["WR","TE","QB"]), pass_bump,
+                 np.where(pos == "RB", -0.5 * pass_bump, 0.0))
+
+    # TEAM_TENDENCY bump (small)
+    tend_bump = W["tend_w"] * tend_sig
+    tend_bump = np.where(pos.isin(["WR","TE","QB"]), tend_bump,
+                 np.where(pos == "RB", -0.5 * tend_bump, 0.0))
+
+    # Global penalties (small)
+    vol_pen = W["vol_w"] * vol_idx
+    inj_pen = W["inj_w"] * inj_idx
+
+    # Combine into adjusted projection
+    # Clamp net bump to reasonable range to avoid extreme sheet values
+    net_bump = np.clip(sched_bump + def_bump + pass_bump + tend_bump, -0.20, 0.20)
+    net_pen  = np.clip(vol_pen + inj_pen, 0.0, 0.35)
+
+    adj_proj = base_proj * (1.0 + net_bump) * (1.0 - net_pen)
+
+    df["EVAL_PTS"] = adj_proj.fillna(0.0)
+
+    # --- Compute VBD ---
+    starters = _starters_map(int(teams), roster_positions)
+    replacement_by_pos: Dict[str, float] = {}
+
+    out_frames = []
+    for p in ["QB","RB","WR","TE","K","DEF"]:
+        p_df = df[df["POS"] == p].copy()
+        if p_df.empty:
+            replacement_by_pos[p] = 0.0
+            continue
+        starters_total = int(starters.get(p, 0)) * int(teams)
+        starters_total = max(1, starters_total)
+        repl = _replacement_points(p_df, starters_total)
+        replacement_by_pos[p] = float(repl)
+        p_df["VBD"] = p_df["EVAL_PTS"] - repl
+        out_frames.append(p_df)
+
+    if not out_frames:
+        return pd.DataFrame([]), replacement_by_pos
+
+    res = pd.concat(out_frames, ignore_index=True)
+
+    # Keep useful columns if present
+    for src, dst in [(c_player, "PLAYER"), (c_team, "TEAM"), (c_pos, "POS"),
+                     (c_adp, "ADP"), (c_ecr, "ECR"), (c_tier, "TIER"), (c_bye, "BYE")]:
+        if src and src != dst and src in res and dst not in res:
+            res[dst] = res[src]
+
+    # Clean NaNs
+    for c in ("ADP","ECR","TIER","BYE","VBD","EVAL_PTS"):
+        if c in res:
+            res[c] = pd.to_numeric(res[c], errors="coerce")
+
+    # Sort by VBD then EVAL_PTS as default view
+    res = res.sort_values(["VBD","EVAL_PTS"], ascending=False).reset_index(drop=True)
+    return res, replacement_by_pos
