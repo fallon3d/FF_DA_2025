@@ -66,7 +66,7 @@ def sidebar_controls():
     st.sidebar.header("Weights")
     inj_w = st.sidebar.slider("Injury penalty weight", 0.0, 1.0, 0.5, 0.05)
     sos_w = st.sidebar.slider("Schedule strength weight", 0.0, 0.3, 0.05, 0.01)
-    usage_w = st.sidebar.slider("Usage/Upside weight", 0.0, 0.5, 0.05, 0.01)
+    usage_w = st.sidebar.slider("Usage/Upside weight (reserved)", 0.0, 0.5, 0.05, 0.01)
     weights = {"inj_w": inj_w, "sos_w": sos_w, "usage_w": usage_w}
 
     st.sidebar.header("Sleeper (Live)")
@@ -249,7 +249,7 @@ def _detect_my_slot(users: List[dict], draft_meta: dict, pick_log: List[dict], s
     # fallback
     return 1
 
-# ---------- NEW: direct raw counter fallback for owned counts ----------
+# ---------- direct raw counter fallback for owned counts ----------
 def _count_owned_for_slot_raw(raw_picks: List[dict], players_map: dict, my_slot: int) -> Dict[str,int]:
     """
     Fallback counter: if team map returns zeros, count my owned positions
@@ -260,7 +260,6 @@ def _count_owned_for_slot_raw(raw_picks: List[dict], players_map: dict, my_slot:
         return counts
 
     for p in raw_picks or []:
-        # prefer draft_slot; fallback to roster_id
         slot = p.get("draft_slot", p.get("roster_id", 0))
         try:
             slot = int(slot)
@@ -277,7 +276,6 @@ def _count_owned_for_slot_raw(raw_picks: List[dict], players_map: dict, my_slot:
                 pm = players_map.get(pid) or {}
                 pos = (pm.get("position") or "").strip().upper()
 
-        # normalize defense labels
         if pos in ("DST","D/ST","DEFENSE","TEAM D","TEAM DEF"):
             pos = "DEF"
 
@@ -489,8 +487,20 @@ def score_strategies(
     results.sort(key=lambda x: (x["score"], x["name"] == "Balanced"), reverse=True)
     return results
 
+def render_strategy_choices(top3: List[Dict[str,object]], total_rounds: int):
+    with st.container():
+        st.markdown("**Strategy Recommendations (Top 3)**")
+        rows = []
+        for i, s in enumerate(top3[:3], start=1):
+            plan = s.get("plan", {})
+            next_rounds = sorted([r for r in plan.keys() if r <= total_rounds])[:3]
+            preview = ", ".join([f"R{r}:{plan[r]}" for r in next_rounds]) if next_rounds else ""
+            rows.append({"Rank": i, "Strategy": s["name"], "Why": s["why"], "Next picks preview": preview})
+        if rows:
+            st.table(pd.DataFrame(rows))
+
 def render_strategy_panel(current: Dict[str,object], targets: Dict[str,int], total_rounds: int):
-    with st.container(border=True):
+    with st.container():
         st.markdown(f"**Current Strategy (dynamic):** {current['name']}")
         st.caption(current["why"])
         plan = current.get("plan") or {}
@@ -515,10 +525,9 @@ def render_strategy_health(my_counts: Dict[str,int], targets: Dict[str,int], pla
         {"POS": p, "Owned": owned[p], "Target": tgt[p], "Remaining": remain[p]}
         for p in ["QB","RB","WR","TE","DEF","K"]
     ])
-    with st.container(border=True):
+    with st.container():
         st.markdown("**Strategy Health**")
         st.table(df)
-        # sanity checks
         msgs = []
         if remain["DEF"] > 0 and (plan.get(total_rounds-1) != "DEF" and plan.get(total_rounds) != "DEF"):
             msgs.append("DEF not yet reserved in last rounds—will force in suggestions.")
@@ -589,7 +598,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     rnd, pick_in_rnd, slot_on_clock = snake_position(next_overall, teams)
     team_display = slot_to_display_name(slot_on_clock, users, rosters)
 
-    # >>> Robust slot resolution <<<
+    # robust slot resolution
     my_slot = _detect_my_slot(users, draft_meta, pick_log, seat_override, username)
     you_on_clock = (slot_on_clock == my_slot)
 
@@ -597,7 +606,6 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         f"**Current Pick:** Round {rnd}, Pick {pick_in_rnd} — **{team_display}** on the clock."
         + (" 🎯 _(That’s you)_" if you_on_clock else "")
     )
-    # NEW: small caption to confirm which slot source is used
     manual_used = (seat_override is not None and int(seat_override) > 0)
     st.caption(f"Using draft slot: {my_slot} ({'manual' if manual_used else 'auto-detected'})")
 
@@ -614,11 +622,9 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         current_picks=taken_keys, next_pick_window=picks_until_next
     )
 
-    # Owned counts from normalized log — keyed by my (resolved) slot
+    # Owned counts
     team_counts = _team_pos_counts_from_log(pick_log, teams)
     my_counts = team_counts.get(my_slot, {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DEF":0})
-
-    # >>> NEW FALLBACK: if zeros but there are picks, use raw counter with my manual slot <<<
     if sum(my_counts.values()) == 0 and len(raw_picks) > 0 and my_slot > 0:
         my_counts = _count_owned_for_slot_raw(raw_picks, players_map, my_slot)
 
@@ -636,13 +642,25 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
     current = strat_ranked[0]
     targets = STRAT_TARGETS.get(current["name"], STRAT_TARGETS["Balanced"])
 
+    # Show Top-3 strategy recommendations
+    top3 = strat_ranked[:3]
+    render_strategy_choices(top3, rounds_total)
+
     # ===== Suggested Picks FIRST (top of screen) =====
     base_need = {"QB":0,"RB":0,"WR":0,"TE":0}
     for pos in base_need:
         want = max(1, targets.get(pos, 0))
         base_need[pos] = max(0, want - my_counts.get(pos, 0))
 
-    sugg = suggest(avail_df, base_need, weights, topk=8)
+    sugg = suggest(
+        avail_df,
+        base_need,
+        weights,
+        topk=8,
+        strategy_name=current["name"],
+        round_number=rnd,
+        total_rounds=rounds_total,
+    )
 
     # QB cap
     qb_have = int(my_counts.get("QB", 0))
@@ -655,7 +673,7 @@ def live_tab(csv_df, weights, league_id, username, seat_override, poll_secs, aut
         sugg, avail_df, rnd, rounds_total, include_k_def_anytime, need_k, need_def
     )
 
-    # Pivot for this pick if run/tier cliff erases edge
+    # Pivot if run/tier cliff erases edge
     if not sugg.empty:
         top_pos = sugg.iloc[0]["POS"]
         depth_top, edge_top = _tier_depth(avail_df, top_pos)
@@ -813,11 +831,23 @@ def mock_tab(csv_df, weights, include_k_def_anytime):
     current = strat_ranked[0]
     targets = STRAT_TARGETS.get(current["name"], STRAT_TARGETS["Balanced"])
 
+    # Show Top-3 strategies
+    top3 = strat_ranked[:3]
+    render_strategy_choices(top3, rounds)
+
     # Suggestions
     base_need = {"QB":1,"RB":2,"WR":2,"TE":1}
     for pos in base_need:
         base_need[pos] = max(1, targets.get(pos, base_need[pos]))
-    sugg = suggest(S["available"], base_need, weights, topk=8)
+    sugg = suggest(
+        S["available"],
+        base_need,
+        weights,
+        topk=8,
+        strategy_name=current["name"],
+        round_number=rnd,
+        total_rounds=rounds
+    )
     sugg = _apply_qb_cap(sugg, qb_have_practice, QB_ROSTER_CAP)
 
     need_k = max(0, targets.get("K",1) - my_counts.get("K",0))
@@ -856,6 +886,8 @@ def mock_tab(csv_df, weights, include_k_def_anytime):
     st.markdown("### Player Board (Available)")
     show_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","INJURY_RISK","SOS_SEASON"]
     st.dataframe(S["available"][show_cols].sort_values(["VBD","EVAL_PTS"], ascending=False), use_container_width=True)
+    csv = S["available"][show_cols].to_csv(index=False).encode()
+    st.download_button("Download available board CSV", csv, "available_board.csv", "text/csv")
 
 # =========================
 # Board tab
