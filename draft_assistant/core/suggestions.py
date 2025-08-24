@@ -1,163 +1,122 @@
 from __future__ import annotations
-from typing import Dict, List
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-"""
-Strategy-aware (but profile-free) pick ranking.
+# --- Strategy-aware suggestion scoring ---
+_STRAT_MUL = {
+    # base multipliers by position; will be tweaked by round/needs
+    "Zero RB":        {"RB": 0.92, "WR": 1.10, "TE": 1.06, "QB": 1.02},
+    "Modified Zero RB":{"RB": 0.96, "WR": 1.08, "TE": 1.05, "QB": 1.02},
+    "Hero RB":        {"RB": 1.12, "WR": 1.02, "TE": 1.00, "QB": 1.00},
+    "Robust RB":      {"RB": 1.10, "WR": 0.98, "TE": 0.98, "QB": 0.98},
+    "Hyper-Fragile RB":{"RB": 0.90, "WR": 1.06, "TE": 1.03, "QB": 1.00},
+    "WR-Heavy":       {"RB": 0.95, "WR": 1.12, "TE": 1.06, "QB": 1.02},
+    "Pocket QB":      {"RB": 1.00, "WR": 1.02, "TE": 1.00, "QB": 0.92},
+    "Bimodal RB":     {"RB": 1.04, "WR": 1.02, "TE": 1.00, "QB": 1.00},
+    "Balanced":       {"RB": 1.00, "WR": 1.00, "TE": 1.00, "QB": 1.00},
+}
 
-We build a composite SCORE for each available player using:
-- VBD (primary signal)
-- VONA (value over next available at the same position by your next pick)
-- Roster need bonus (light guardrails so you don’t leave holes)
-- Tier cliff bonus (prefer players just before a drop at their position)
-- ADP value bonus (mild preference for fallers)
-- Injury risk penalty (scaled by sidebar weight)
+def _z(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    mu, sd = s.mean(skipna=True), s.std(skipna=True)
+    if not np.isfinite(sd) or sd == 0:
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s - mu) / sd
 
-Return the top K with human-readable REASONS so you can pivot easily.
-"""
+def _need_multiplier(pos: str, need_count: int) -> float:
+    # small but meaningful boost for unmet needs
+    if need_count <= 0:
+        # slight de-emphasis when a slot is already 'covered'
+        return 0.94 if pos in ("QB","TE") else 0.97
+    # escalate with need count (e.g., still need 2+ WRs)
+    base = 1.00 + 0.18 * min(3, int(need_count))
+    if pos in ("QB","TE"):
+        base += 0.07  # single-slot positions need a little more push
+    return float(base)
 
-REASON_LIMIT = 3
-
-# -------------------------
-# Component signals
-# -------------------------
-
-def _need_bonus(row: pd.Series, need_state: Dict[str, int]) -> float:
-    """
-    Soft push toward positions you’re light on (starters + 1 depth).
-    Each missing slot adds a small constant to the score.
-    """
-    pos = row["POS"]
-    need = int(need_state.get(pos, 0))
-    return 3.0 * float(need)  # tuneable constant
-
-
-def _adp_value_bonus(row: pd.Series) -> float:
-    """
-    Favor ADP fallers a bit. We don’t know your exact pick number here,
-    so we use simple thresholds as a mild ranking nudge.
-    """
-    adp = row.get("ADP", np.nan)
-    if pd.isna(adp):
-        return 0.0
-    # early-round value
-    if adp <= 36:
+def _round_phase_multiplier(strategy: str, pos: str, round_number: Optional[int], total_rounds: Optional[int]) -> float:
+    if round_number is None or total_rounds is None:
         return 1.0
-    # mid-round value pocket
-    if adp <= 60:
-        return 0.5
-    return 0.0
+    r = int(round_number); R = int(total_rounds)
+    early = r <= max(3, R // 5)
+    mid   = (R // 5) < r <= (3 * R) // 5
 
-
-def _risk_penalty(row: pd.Series, risk_w: float) -> float:
-    """
-    Penalize players with higher INJURY_VAL (0.0–~0.2 typical).
-    Multiplied by a weight from the sidebar to reflect your appetite.
-    """
-    r = row.get("INJURY_VAL", np.nan)
-    if pd.isna(r):
-        return 0.0
-    return -5.0 * risk_w * float(r)  # tuneable slope
-
-
-def _tier_bonus(row: pd.Series, df: pd.DataFrame) -> float:
-    """
-    If the next player at the same position is a meaningful drop in EVAL_PTS,
-    reward the current player (he’s at a tier edge).
-    """
-    pos = row["POS"]
-    pos_df = df[df["POS"] == pos].sort_values("EVAL_PTS", ascending=False).reset_index(drop=True)
-    idx_list = pos_df.index[pos_df["PLAYER_KEY"] == row["PLAYER_KEY"]].tolist()
-    if not idx_list:
-        return 0.0
-    i = idx_list[0]
-    if i + 1 < len(pos_df):
-        drop = float(pos_df.iloc[i]["EVAL_PTS"] - pos_df.iloc[i + 1]["EVAL_PTS"])
-        # Scale the cliff; cap to avoid overdominance
-        return min(5.0, max(0.0, drop / 5.0))
-    return 0.0
-
-
-def _ceiling_flag(row: pd.Series) -> float:
-    """
-    Optional micro-bump for players likely to deliver spike-weeks.
-    Heuristic: higher REDZONE_TGT and GOAL_LINE_SHARE -> tiny boost.
-    """
-    rz = row.get("REDZONE_TGT", np.nan)
-    gl = row.get("GOAL_LINE_SHARE", np.nan)
-    rz = 0.0 if pd.isna(rz) else float(rz)
-    gl = 0.0 if pd.isna(gl) else float(gl)
-    # Very small bump; prevents overpowering VBD/VONA
-    return 0.1 * (rz > 15) + 0.1 * (gl > 0.35)
-
-
-# -------------------------
-# Reasons (human-readable)
-# -------------------------
-
-def reason_strings(row: pd.Series, need_state: Dict[str, int]) -> List[str]:
-    reasons: List[str] = []
-    # Always show VBD
-    reasons.append(f"VBD +{row['VBD']:.1f}")
-    # Show VONA if positive
-    if row.get("VONA", 0) > 0:
-        reasons.append(f"VONA +{row['VONA']:.1f}")
-    # Roster need callout
-    if need_state.get(row["POS"], 0) > 0:
-        reasons.append(f"Roster need at {row['POS']}")
-    # ADP note if available
-    adp = row.get("ADP", np.nan)
-    if not pd.isna(adp):
-        reasons.append(f"ADP {int(adp)}")
-    # Trim
-    if len(reasons) > REASON_LIMIT:
-        reasons = reasons[:REASON_LIMIT]
-    return reasons
-
-
-# -------------------------
-# Public API
-# -------------------------
+    m = 1.0
+    if strategy == "Zero RB":
+        if early and pos == "RB": m *= 0.88
+        if early and pos in ("WR","TE"): m *= 1.10
+        if mid and pos == "RB": m *= 1.04
+    elif strategy == "Modified Zero RB":
+        if early and pos == "RB": m *= 0.93
+        if early and pos in ("WR","TE"): m *= 1.08
+        if mid and pos == "RB": m *= 1.06
+    elif strategy == "Hero RB":
+        if early and pos == "RB": m *= 1.14
+        if not early and pos == "RB": m *= 0.90
+    elif strategy == "Robust RB":
+        if early and pos == "RB": m *= 1.10
+    elif strategy == "Hyper-Fragile RB":
+        if not early and pos == "RB": m *= 0.88
+    elif strategy == "WR-Heavy":
+        if early and pos == "WR": m *= 1.12
+        if early and pos == "RB": m *= 0.94
+    elif strategy == "Pocket QB":
+        if early and pos == "QB": m *= 0.85
+        if mid   and pos == "QB": m *= 1.08
+    elif strategy == "Bimodal RB":
+        if mid and pos == "RB": m *= 1.08
+    return float(m)
 
 def suggest(
     avail_df: pd.DataFrame,
-    roster_needs: Dict[str, int],
+    need_by_pos: Dict[str, int],
     weights: Dict[str, float],
-    topk: int = 8
+    topk: int = 8,
+    strategy_name: Optional[str] = None,
+    round_number: Optional[int] = None,
+    total_rounds: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Rank available players by composite score and return the top-K
-    with concise rationale strings for quick decision-making.
+    Return avail_df with a 'score' column, ranked for suggestion.
+    The caller (app) handles plain-English explanations & probability to return.
     """
+    if avail_df is None or avail_df.empty:
+        return pd.DataFrame([])
+
     df = avail_df.copy()
-    if df.empty:
-        return df
 
-    scores = []
-    inj_w = float(weights.get("inj_w", 0.5))
+    # Normalized components (global z)
+    z_vbd  = _z(df.get("VBD", 0.0))
+    z_eval = _z(df.get("EVAL_PTS", 0.0))
 
-    for _, r in df.iterrows():
-        score = (
-            1.00 * float(r.get("VBD", 0.0)) +           # primary signal
-            0.50 * float(r.get("VONA", 0.0)) +          # protection vs. position drying up
-            _need_bonus(r, roster_needs) +              # guardrail
-            _tier_bonus(r, df) +                        # pre-cliff preference
-            _adp_value_bonus(r) +                       # mild value nod
-            _risk_penalty(r, risk_w=inj_w) +            # risk tolerance
-            _ceiling_flag(r)                            # tiny ceiling nudge
-        )
-        scores.append(score)
+    # Value delta: if both ADP & ECR exist, good if ECR < ADP (draft value)
+    ecr = pd.to_numeric(df.get("ECR", np.nan), errors="coerce")
+    adp = pd.to_numeric(df.get("ADP", np.nan), errors="coerce")
+    val_delta = pd.Series(np.zeros(len(df)), index=df.index)
+    if "ECR" in df.columns and "ADP" in df.columns:
+        # lower ECR vs ADP -> value
+        val_delta = _z(adp - ecr)  # positive if ADP >> ECR (discount vs rank)
 
-    df["SCORE"] = scores
-    df = df.sort_values(["SCORE", "VBD", "EVAL_PTS"], ascending=False)
+    # base score
+    score = 0.58 * z_vbd + 0.34 * z_eval + 0.08 * val_delta
 
-    # Reasons column
-    df["REASONS"] = df.apply(lambda row: "; ".join(reason_strings(row, roster_needs)), axis=1)
+    # Apply needs & strategy multipliers
+    pos = df["POS"].astype(str).str.upper()
+    strat = strategy_name or "Balanced"
+    base_mul_map = _STRAT_MUL.get(strat, _STRAT_MUL["Balanced"])
 
-    cols = ["PLAYER", "TEAM", "POS", "TIER", "EVAL_PTS", "VBD", "VONA", "ADP", "SCORE", "REASONS", "PLAYER_KEY"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
+    pos_mul = []
+    for i in range(len(df)):
+        p = pos.iat[i]
+        need_cnt = int(need_by_pos.get(p, 0))
+        m = base_mul_map.get(p, 1.0)
+        m *= _need_multiplier(p, need_cnt)
+        m *= _round_phase_multiplier(strat, p, round_number, total_rounds)
+        pos_mul.append(m)
 
-    return df.head(topk)[cols]
+    score = score * pd.Series(pos_mul, index=df.index)
+
+    df["score"] = score.astype(float)
+    df = df.sort_values(["score","VBD","EVAL_PTS"], ascending=False).reset_index(drop=True)
+    return df.head(topk)
