@@ -1,122 +1,145 @@
 from __future__ import annotations
-from typing import Dict, List, Optional
+import os
+from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# --- Strategy-aware suggestion scoring ---
-_STRAT_MUL = {
-    # base multipliers by position; will be tweaked by round/needs
-    "Zero RB":        {"RB": 0.92, "WR": 1.10, "TE": 1.06, "QB": 1.02},
-    "Modified Zero RB":{"RB": 0.96, "WR": 1.08, "TE": 1.05, "QB": 1.02},
-    "Hero RB":        {"RB": 1.12, "WR": 1.02, "TE": 1.00, "QB": 1.00},
-    "Robust RB":      {"RB": 1.10, "WR": 0.98, "TE": 0.98, "QB": 0.98},
-    "Hyper-Fragile RB":{"RB": 0.90, "WR": 1.06, "TE": 1.03, "QB": 1.00},
-    "WR-Heavy":       {"RB": 0.95, "WR": 1.12, "TE": 1.06, "QB": 1.02},
-    "Pocket QB":      {"RB": 1.00, "WR": 1.02, "TE": 1.00, "QB": 0.92},
-    "Bimodal RB":     {"RB": 1.04, "WR": 1.02, "TE": 1.00, "QB": 1.00},
-    "Balanced":       {"RB": 1.00, "WR": 1.00, "TE": 1.00, "QB": 1.00},
-}
+# --- Tunables (env overrides supported) ---
+QB_SUPPRESS_UNTIL_ROUND = int(os.getenv("FFDA_QB_SUPPRESS_UNTIL_ROUND", "6"))    # hide QB until this round
+QB_EARLY_EDGE_GATE      = float(os.getenv("FFDA_QB_EARLY_EDGE_GATE", "22.0"))    # allow early QB only if QB VBD exceeds best non-QB by this
+QB_STRICT_POCKET_ROUND  = int(os.getenv("FFDA_QB_STRICT_POCKET_ROUND", "7"))     # even stricter for "Pocket QB"
+K_DEF_EARLY_PENALTY_RND = int(os.getenv("FFDA_K_DEF_EARLY_PENALTY_RND", "14"))   # discourage K/DEF before final two rounds
+SCARCITY_TIER_SIZE      = int(os.getenv("FFDA_SCARCITY_TIER_SIZE", "2"))         # if <= this many left in tier, add scarcity bump
+SCARCITY_BUMP           = float(os.getenv("FFDA_SCARCITY_BUMP", "8.0"))
+NEED_BUMP               = float(os.getenv("FFDA_NEED_BUMP", "3.0"))
+NO_NEED_PEN             = float(os.getenv("FFDA_NO_NEED_PEN", "1.5"))
 
-def _z(s: pd.Series) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    mu, sd = s.mean(skipna=True), s.std(skipna=True)
+def _z(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    mu = s.mean(skipna=True)
+    sd = s.std(skipna=True)
     if not np.isfinite(sd) or sd == 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
+        return pd.Series(np.zeros(len(series)), index=series.index)
     return (s - mu) / sd
 
-def _need_multiplier(pos: str, need_count: int) -> float:
-    # small but meaningful boost for unmet needs
-    if need_count <= 0:
-        # slight de-emphasis when a slot is already 'covered'
-        return 0.94 if pos in ("QB","TE") else 0.97
-    # escalate with need count (e.g., still need 2+ WRs)
-    base = 1.00 + 0.18 * min(3, int(need_count))
-    if pos in ("QB","TE"):
-        base += 0.07  # single-slot positions need a little more push
-    return float(base)
+def _top_vbd(avail_df: pd.DataFrame, pos: str) -> float:
+    pool = avail_df[avail_df["POS"] == pos]
+    if pool.empty:
+        return 0.0
+    srt = pool.sort_values(["VBD","EVAL_PTS"], ascending=False)
+    return float(pd.to_numeric(srt.iloc[0].get("VBD"), errors="coerce") or 0.0)
 
-def _round_phase_multiplier(strategy: str, pos: str, round_number: Optional[int], total_rounds: Optional[int]) -> float:
-    if round_number is None or total_rounds is None:
-        return 1.0
-    r = int(round_number); R = int(total_rounds)
-    early = r <= max(3, R // 5)
-    mid   = (R // 5) < r <= (3 * R) // 5
+def _best_non_qb_edge(avail_df: pd.DataFrame) -> float:
+    edges = []
+    for p in ("RB","WR","TE"):
+        edges.append(_top_vbd(avail_df, p))
+    return float(max(edges) if edges else 0.0)
 
-    m = 1.0
-    if strategy == "Zero RB":
-        if early and pos == "RB": m *= 0.88
-        if early and pos in ("WR","TE"): m *= 1.10
-        if mid and pos == "RB": m *= 1.04
-    elif strategy == "Modified Zero RB":
-        if early and pos == "RB": m *= 0.93
-        if early and pos in ("WR","TE"): m *= 1.08
-        if mid and pos == "RB": m *= 1.06
-    elif strategy == "Hero RB":
-        if early and pos == "RB": m *= 1.14
-        if not early and pos == "RB": m *= 0.90
-    elif strategy == "Robust RB":
-        if early and pos == "RB": m *= 1.10
-    elif strategy == "Hyper-Fragile RB":
-        if not early and pos == "RB": m *= 0.88
-    elif strategy == "WR-Heavy":
-        if early and pos == "WR": m *= 1.12
-        if early and pos == "RB": m *= 0.94
-    elif strategy == "Pocket QB":
-        if early and pos == "QB": m *= 0.85
-        if mid   and pos == "QB": m *= 1.08
-    elif strategy == "Bimodal RB":
-        if mid and pos == "RB": m *= 1.08
-    return float(m)
+def _apply_position_needs_score(df: pd.DataFrame, base_need: Dict[str,int]) -> pd.DataFrame:
+    # small bump if we still need that position; small penalty if we don't
+    need_adj = []
+    for _, r in df.iterrows():
+        pos = str(r.get("POS") or "")
+        need_adj.append(NEED_BUMP if base_need.get(pos, 0) > 0 else -NO_NEED_PEN)
+    out = df.copy()
+    out["__NEED__"] = need_adj
+    return out
+
+def _scarcity_bump(df: pd.DataFrame) -> pd.DataFrame:
+    """If player is in a small remaining tier (<= SCARCITY_TIER_SIZE), add a bump."""
+    out = df.copy()
+    out["__SCARCITY__"] = 0.0
+    if "TIER" not in df.columns:
+        return out
+    for pos in ("RB","WR","TE","QB"):
+        sub = out[out["POS"] == pos]
+        if sub.empty: 
+            continue
+        for tier, tdf in sub.groupby("TIER"):
+            try:
+                tier_left = len(tdf)
+            except Exception:
+                tier_left = 0
+            if pd.isna(tier) or tier_left == 0:
+                continue
+            if tier_left <= SCARCITY_TIER_SIZE:
+                out.loc[tdf.index, "__SCARCITY__"] = SCARCITY_BUMP
+    return out
+
+def _gate_qb_early(df: pd.DataFrame, avail_df: pd.DataFrame, round_number: int, strategy_name: Optional[str]) -> pd.DataFrame:
+    """Suppress QB in early rounds unless the edge is overwhelming."""
+    if df.empty:
+        return df
+
+    qb_round_gate = QB_SUPPRESS_UNTIL_ROUND
+    if str(strategy_name or "").lower() == "pocket qb":
+        qb_round_gate = max(qb_round_gate, QB_STRICT_POCKET_ROUND)
+
+    qb_edge = _top_vbd(avail_df, "QB")
+    nonqb_edge = _best_non_qb_edge(avail_df)
+
+    qb_allowed_early = (round_number >= qb_round_gate) or (qb_edge >= nonqb_edge + QB_EARLY_EDGE_GATE)
+
+    gated = df.copy()
+    gated["__QB_GATE__"] = 0.0
+    if not qb_allowed_early:
+        gated.loc[gated["POS"] == "QB", "__QB_GATE__"] = -999.0
+    return gated
+
+def _discourage_k_def_too_early(df: pd.DataFrame, round_number: int, total_rounds: int) -> pd.DataFrame:
+    """Heavily discourage K/DEF until the final two rounds."""
+    if df.empty:
+        return df
+    gated = df.copy()
+    gated["__KDEF_PEN__"] = 0.0
+    if round_number < max(1, total_rounds - 1):
+        if round_number < K_DEF_EARLY_PENALTY_RND:
+            gated.loc[gated["POS"].isin(["K","DEF"]), "__KDEF_PEN__"] = -250.0
+    return gated
 
 def suggest(
     avail_df: pd.DataFrame,
-    need_by_pos: Dict[str, int],
-    weights: Dict[str, float],
+    base_need: Dict[str,int],
+    weights: Dict[str, float] | None = None,
     topk: int = 8,
     strategy_name: Optional[str] = None,
-    round_number: Optional[int] = None,
-    total_rounds: Optional[int] = None,
+    round_number: int = 1,
+    total_rounds: int = 15,
 ) -> pd.DataFrame:
     """
-    Return avail_df with a 'score' column, ranked for suggestion.
-    The caller (app) handles plain-English explanations & probability to return.
+    Rank candidates for the current pick. Returns df with 'score' column, sorted desc.
+
+    Core rules:
+      - VBD-first scoring (with a small EVAL_PTS stabilizer).
+      - Tier scarcity bump (if <= SCARCITY_TIER_SIZE remain in their tier).
+      - Needs-aware nudge.
+      - **Hard early QB suppression** unless the edge is truly massive.
+      - **K/DEF discouraged** until late (final two rounds).
     """
     if avail_df is None or avail_df.empty:
-        return pd.DataFrame([])
+        return pd.DataFrame(columns=["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","score"])
 
-    df = avail_df.copy()
+    cand = avail_df.copy()
 
-    # Normalized components (global z)
-    z_vbd  = _z(df.get("VBD", 0.0))
-    z_eval = _z(df.get("EVAL_PTS", 0.0))
+    # Base scoring: mostly VBD, with a small EVAL_PTS stabilizer
+    vbd = pd.to_numeric(cand.get("VBD"), errors="coerce").fillna(0.0)
+    eval_z = _z(cand.get("EVAL_PTS")) if "EVAL_PTS" in cand.columns else pd.Series(np.zeros(len(cand)), index=cand.index)
+    cand["__BASE__"] = (0.88 * vbd) + (0.12 * eval_z)
 
-    # Value delta: if both ADP & ECR exist, good if ECR < ADP (draft value)
-    ecr = pd.to_numeric(df.get("ECR", np.nan), errors="coerce")
-    adp = pd.to_numeric(df.get("ADP", np.nan), errors="coerce")
-    val_delta = pd.Series(np.zeros(len(df)), index=df.index)
-    if "ECR" in df.columns and "ADP" in df.columns:
-        # lower ECR vs ADP -> value
-        val_delta = _z(adp - ecr)  # positive if ADP >> ECR (discount vs rank)
+    # Needs & scarcity
+    cand = _apply_position_needs_score(cand, base_need)
+    cand = _scarcity_bump(cand)
 
-    # base score
-    score = 0.58 * z_vbd + 0.34 * z_eval + 0.08 * val_delta
+    # Gating
+    cand = _gate_qb_early(cand, avail_df, round_number, strategy_name)
+    cand = _discourage_k_def_too_early(cand, round_number, total_rounds)
 
-    # Apply needs & strategy multipliers
-    pos = df["POS"].astype(str).str.upper()
-    strat = strategy_name or "Balanced"
-    base_mul_map = _STRAT_MUL.get(strat, _STRAT_MUL["Balanced"])
+    # Final score
+    for col in ("__QB_GATE__", "__KDEF_PEN__", "__NEED__", "__SCARCITY__", "__BASE__"):
+        if col not in cand.columns:
+            cand[col] = 0.0
+    cand["score"] = cand["__BASE__"] + cand["__NEED__"] + cand["__SCARCITY__"] + cand["__QB_GATE__"] + cand["__KDEF_PEN__"]
 
-    pos_mul = []
-    for i in range(len(df)):
-        p = pos.iat[i]
-        need_cnt = int(need_by_pos.get(p, 0))
-        m = base_mul_map.get(p, 1.0)
-        m *= _need_multiplier(p, need_cnt)
-        m *= _round_phase_multiplier(strat, p, round_number, total_rounds)
-        pos_mul.append(m)
-
-    score = score * pd.Series(pos_mul, index=df.index)
-
-    df["score"] = score.astype(float)
-    df = df.sort_values(["score","VBD","EVAL_PTS"], ascending=False).reset_index(drop=True)
-    return df.head(topk)
+    out_cols = ["PLAYER","TEAM","POS","TIER","ADP","EVAL_PTS","VBD","score"]
+    cand = cand.sort_values("score", ascending=False)
+    return cand[out_cols].head(int(topk)).reset_index(drop=True)
